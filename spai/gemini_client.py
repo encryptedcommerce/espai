@@ -47,17 +47,15 @@ class GeminiClient:
                 prompt,
                 generation_config={"temperature": self.temperature}
             )
-            if self.verbose:
-                print(f"Raw response text: {response.text}")
             return response.text
             
         try:
             return await self.rate_limiter.execute(_generate)
         except Exception as e:
             if self.verbose:
-                print(f"Error generating content: {str(e)}")
+                print(f"\n[Error] Generation failed: {str(e)}")
             raise
-    
+            
     async def _generate_and_parse_json(self, prompt: str) -> Any:
         """Generate content and parse it as JSON."""
         try:
@@ -131,10 +129,14 @@ Query: "{query}"
             if not result or "entity" not in result or "attributes" not in result or "search_space" not in result:
                 raise ValueError("Missing required fields in query parsing result")
             
+            if self.verbose:
+                print("\nParsed query:")
+                print(json.dumps(result, indent=4))
+            
             return result["entity"], result["attributes"], result["search_space"]
         except Exception as e:
             if self.verbose:
-                print(f"Error parsing query: {str(e)}")
+                print(f"\n[Error] Failed to parse query: {str(e)}")
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
     async def enumerate_search_space(self, search_space: str) -> List[str]:
@@ -201,6 +203,10 @@ Return ONLY a JSON array of 5-digit zip code strings. Format each zip code as a 
                 if not all_items:
                     raise ValueError("No items found in any region")
                     
+                if self.verbose:
+                    print("\nEnumerated search space:")
+                    print(json.dumps(all_items, indent=4))
+                    
                 return sorted(list(set(all_items)))  # Remove duplicates and sort
                 
             except Exception as e:
@@ -235,36 +241,62 @@ Query: "{search_space}"
             if not result or not isinstance(result, list):
                 raise ValueError("Expected JSON array of items")
             
+            if self.verbose:
+                print("\nEnumerated search space:")
+                print(json.dumps(result, indent=4))
+            
             return result
             
         except Exception as e:
             if self.verbose:
-                print(f"Error enumerating search space: {str(e)}")
+                print(f"\n[Error] Failed to enumerate search space: {str(e)}")
             raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
     
     def _build_extraction_prompt(self, text: str, entity_type: str, attributes: List[str]) -> str:
-        """Build a prompt for extracting information from text."""
-        attrs_str = "\n".join([f"- {attr}" for attr in attributes])
-        return f"""Extract information about the {entity_type} from the following text. Return a JSON object with these fields:
-{attrs_str}
+        """Build a prompt for extracting attributes from text."""
+        prompt = f"""Extract information about {entity_type} from this text. Return ONLY a JSON object with these fields: {', '.join(attributes)}.
+If you cannot find valid information for the requested entity type, return an empty object {{}}.
 
-If you cannot find the required information, return an empty JSON object {{}}.
-Do not make up or guess any information.
+Here are the requirements for each field:
+- name: The full name of the {entity_type}
+- address: A complete address with street, city, and state
+
+Example valid outputs:
+{{
+    "name": "Elite Fitness Center",
+    "address": "123 Main Street, Boston, MA 02108"
+}}
+
+or if no valid information is found:
+{{}}
 
 Text to analyze:
 {text}
 
 Return ONLY the JSON object, no other text:"""
+        return prompt
     
     async def parse_search_result(self, text: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, Any]]:
         """Parse search result text into structured data based on requested attributes."""
         try:
-            prompt = self._build_extraction_prompt(text, entity_type, attributes)
-            result = await self._generate_and_parse_json(prompt)
+            if self.verbose:
+                print(f"\n[Search Result]:")
+                print(text[:200] + "..." if len(text) > 200 else text)
+            
+            result = await self._generate_and_parse_json(
+                self._build_extraction_prompt(text, entity_type, attributes)
+            )
+            
+            if self.verbose and result:
+                print("\n[Extracted Data]:")
+                print(json.dumps(result, indent=2))
+            elif self.verbose:
+                print("[No Data Extracted]")
+                
             return result if result else None
         except Exception as e:
             if self.verbose:
-                print(f"Error parsing search result: {str(e)}")
+                print(f"\n[Error] Failed to parse search result: {str(e)}")
             return None
     
     async def extract_attribute(self, entity_name: str, attribute: str, text: str) -> Optional[dict]:
