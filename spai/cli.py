@@ -63,9 +63,12 @@ def signal_handler(signum, frame):
     if not should_shutdown:  # Only handle first Ctrl-C
         console.print("\n[yellow]Received interrupt signal. Writing current results and shutting down...[/yellow]")
         should_shutdown = True
-        # Write current results
+        # Write current results only if we have any
         if _current_results:
             write_results(_current_results, fmt=_global_output_format, file=_global_output_file)
+        else:
+            console.print("[yellow]No results to write, exiting...[/yellow]")
+            sys.exit(1)  # Exit immediately if no results
 
 # Register signal handler
 signal.signal(signal.SIGINT, signal_handler)
@@ -208,188 +211,233 @@ async def async_main(
     verbose: bool,
 ) -> None:
     """Main async function to handle the search and extraction process."""
-    global _current_results, _global_output_format, _global_output_file
+    global _current_results, _global_output_format, _global_output_file, should_shutdown
     
     # Store output settings for signal handler
     _global_output_format = output_format
     _global_output_file = output_file or "results.csv"
     
-    if verbose:
-        console.print("[yellow]Initializing clients...[/yellow]")
-    
-    gemini = GeminiClient(verbose=verbose, temperature=temperature)
-    search = GoogleSearchClient(max_results=max_results)
-    
-    # Parse the query
-    if verbose:
-        console.print("[yellow]Parsing query...[/yellow]")
-    try:
-        entity_type, attributes, search_space = await gemini.parse_query(query)
-        if verbose:
-            console.print(f"Entity Type: {entity_type}")
-            console.print(f"Attributes: {attributes}")
-            console.print(f"Search Space: {search_space}")
-    except Exception as e:
-        console.print(f"[red]Error parsing query: {str(e)}[/red]")
-        return
-    
-    # Get search terms
-    try:
-        search_terms = await gemini.enumerate_search_space(search_space)
-    except Exception as e:
-        console.print(f"[red]Error enumerating search space: {str(e)}[/red]")
-        return
-    
-    # Create progress bars
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-        expand=True,
-        transient=False  # Keep the progress bar visible
-    )
-    
-    status_console = Console()  # Separate console for status updates
-    
-    all_search_results = []
-    
-    with progress:
-        # First task: searching
-        search_task = progress.add_task(
-            description="[cyan]Searching...",
-            total=len(search_terms)
-        )
-        
-        # Search for each term
-        for term in search_terms:
-            if should_shutdown:
-                break
-                
-            search_query = f"{entity_type} in {term}"
-            progress.update(search_task, description=f"[cyan]Searching: {term}")
-            
-            if verbose:
-                # Use print instead of console.print to avoid interfering with progress bar
-                print(f"\033[34mSearching: {search_query}\033[0m")
-            
-            try:
-                results = await search.search(search_query)
-                all_search_results.extend(results)
-            except Exception as e:
-                if verbose:
-                    print(f"\033[31mError searching for {term}: {str(e)}\033[0m")
-            
-            progress.update(search_task, advance=1)
-            
-            # Update global results in case of interrupt
-            _current_results = all_search_results
-    
-    if not all_search_results:
-        status_console.print("[red]No search results found[/red]")
-        return
-    
-    if verbose:
-        status_console.print(f"[green]Found {len(all_search_results)} total results[/green]")
-    
-    # Process results with Gemini
     results = []
     
-    # Single progress bar for all processing
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-        expand=True,
-        transient=False
-    ) as process_progress:
-        # First pass: Extract names from search results
-        first_pass = process_progress.add_task(
-            description="[cyan]Starting name extraction...",
-            total=len(all_search_results)
-        )
-
-        for idx, result in enumerate(all_search_results):
-            title = result.get('title', 'Untitled')
-            # Truncate and pad title to fixed width of 50 chars
-            display_title = f"{title[:47]}..." if len(title) > 50 else title.ljust(50)
-            
-            process_progress.update(
-                first_pass,
-                description=f"[cyan]Extracting from {idx+1}/{len(all_search_results)}: {display_title}"
-            )
-            
-            if verbose:
-                print(f"\033[34mExtracting from: {title}\033[0m")
-            
-            try:
-                # First pass: extract name from title
-                extracted = await gemini.parse_search_result(title, entity_type, ["name"])
-                if extracted and "name" in extracted:
-                    results.append({"name": extracted["name"]})
-                    # Update global results in case of interrupt
-                    _current_results = results
-            except Exception as e:
-                if verbose:
-                    print(f"\033[31mError extracting name: {str(e)}\033[0m\n")
-            finally:
-                # Always update progress, even if no name was extracted
-                process_progress.update(first_pass, advance=1)
+    try:
+        gemini = GeminiClient(verbose=verbose, temperature=temperature)
+        search = GoogleSearchClient(max_results=max_results)
         
-        # Second pass: Search for and extract attributes
-        remaining_attributes = [attr for attr in attributes if attr != "name"]
-        if remaining_attributes and results:
-            second_pass = process_progress.add_task(
-                description="[cyan]Gathering attributes...",
-                total=len(results)
+        # Parse the query
+        if verbose:
+            console.print("[yellow]Parsing query...[/yellow]")
+        try:
+            if should_shutdown:  # Check for early shutdown
+                console.print("\n[yellow]Received interrupt signal. Shutting down...[/yellow]")
+                return
+                
+            entity_type, attributes, search_space = await gemini.parse_query(query)
+            if verbose:
+                console.print(f"Entity Type: {entity_type}")
+                console.print(f"Attributes: {attributes}")
+                console.print(f"Search Space: {search_space}")
+        except Exception as e:
+            console.print(f"[red]Error parsing query: {str(e)}[/red]")
+            return
+            
+        if should_shutdown:  # Check for shutdown after query parsing
+            console.print("\n[yellow]Received interrupt signal. Shutting down...[/yellow]")
+            return
+        
+        # Get search terms
+        try:
+            search_terms = await gemini.enumerate_search_space(search_space)
+        except Exception as e:
+            console.print(f"[red]Error enumerating search space: {str(e)}[/red]")
+            return
+        
+        # Create progress bars
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            expand=True,
+            transient=False  # Keep the progress bar visible
+        )
+        
+        status_console = Console()  # Separate console for status updates
+        
+        all_search_results = []
+        
+        with progress:
+            # First task: searching
+            search_task = progress.add_task(
+                description="[cyan]Searching...",
+                total=len(search_terms)
             )
             
-            for idx, result in enumerate(results):
+            # Search for each term
+            for term in search_terms:
                 if should_shutdown:
                     break
+                    
+                search_query = f"{entity_type} in {term}"
+                progress.update(search_task, description=f"[cyan]Searching: {term}")
                 
-                name = result["name"]
+                if verbose:
+                    # Use print instead of console.print to avoid interfering with progress bar
+                    print(f"\033[34mSearching: {search_query}\033[0m")
+                
+                try:
+                    results = await search.search(search_query)
+                    all_search_results.extend(results)
+                except Exception as e:
+                    if verbose:
+                        print(f"\033[31mError searching for {term}: {str(e)}\033[0m")
+                
+                progress.update(search_task, advance=1)
+                
+                # Update global results in case of interrupt
+                _current_results = all_search_results
+        
+        if not all_search_results:
+            status_console.print("[red]No search results found[/red]")
+            return
+        
+        if verbose:
+            status_console.print(f"[green]Found {len(all_search_results)} total results[/green]")
+        
+        # Process results with Gemini
+        results = []
+        
+        # Single progress bar for all processing
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            expand=True,
+            transient=False
+        ) as process_progress:
+            # First pass: Extract names from search results
+            first_pass = process_progress.add_task(
+                description="[cyan]Starting name extraction...",
+                total=len(all_search_results)
+            )
+
+            # Use a set to track unique names we've seen
+            seen_names = set()
+            
+            for idx, result in enumerate(all_search_results):
+                if should_shutdown:
+                    break
+                    
+                title = result.get('title', 'Untitled')
+                # Truncate and pad title to fixed width of 50 chars
+                display_title = f"{title[:47]}..." if len(title) > 50 else title.ljust(50)
+                
                 process_progress.update(
-                    second_pass,
-                    description=f"[cyan]Gathering attributes for {idx+1}/{len(results)}: {name[:40]}..."
+                    first_pass,
+                    description=f"[cyan]Extracting from {idx+1}/{len(all_search_results)}: {display_title}"
                 )
                 
                 if verbose:
-                    print(f"\033[34mGathering attributes for: {name}\033[0m")
+                    print(f"\033[34mExtracting from: {title}\033[0m")
                 
                 try:
-                    # Search specifically for this entity's attributes
-                    attr_results = await search.search(f'"{name}"')
-                    if not attr_results:
-                        continue
-                    
-                    # Extract attributes from the new search results
-                    for attr_result in attr_results[:3]:  # Try top 3 results
-                        text = attr_result.get("snippet", "") or attr_result.get("text", "")
-                        if not text:
-                            continue
-                        
-                        extracted = await gemini.parse_search_result(text, entity_type, remaining_attributes)
-                        if extracted:
-                            # Update the result with any found attributes
-                            for attr in remaining_attributes:
-                                if attr in extracted:
-                                    result[attr] = extracted[attr]
-                            break  # Stop if we found attributes
-                    
+                    # First pass: extract name from title
+                    extracted = await gemini.parse_search_result(title, entity_type, ["name"])
+                    if extracted and "name" in extracted:
+                        name = extracted["name"]
+                        # Only add if we haven't seen this name before
+                        if name not in seen_names:
+                            seen_names.add(name)
+                            results.append({"name": name})
+                            # Update global results in case of interrupt
+                            _current_results = results
                 except Exception as e:
                     if verbose:
-                        print(f"\033[31mError gathering attributes: {str(e)}\033[0m")
+                        print(f"\033[31mError extracting name: {str(e)}\033[0m\n")
+                finally:
+                    # Always update progress, even if no name was extracted
+                    process_progress.update(first_pass, advance=1)
+
+            # Second pass: Search for and extract attributes
+            remaining_attributes = [attr for attr in attributes if attr != "name"]
+            if remaining_attributes:
+                second_pass = process_progress.add_task(
+                    description="[cyan]Starting attribute extraction...",
+                    total=len(results)
+                )
+
+                for idx, result in enumerate(results):
+                    if should_shutdown:
+                        break
+                        
+                    name = result["name"]
+                    # Truncate name for display
+                    display_name = f"{name[:47]}..." if len(name) > 50 else name.ljust(50)
+                    
+                    process_progress.update(
+                        second_pass,
+                        description=f"[cyan]Gathering attributes for {idx+1}/{len(results)}: {display_name}"
+                    )
+
+                    for attr in remaining_attributes:
+                        if should_shutdown:
+                            break
+                            
+                        # Build search query for specific attribute
+                        query = f'"{name}" {attr}'
+                        if verbose:
+                            print(f"\033[34mobtaining attributes by searching: {query}\033[0m")
+                        
+                        try:
+                            # Search specifically for this entity's attributes
+                            attr_results = await search.search(query)
+                            
+                            # Extract attributes from each search result until we find one
+                            for attr_result in attr_results:
+                                try:
+                                    # Build full text from search result
+                                    text_parts = []
+                                    if attr_result.get("title"):
+                                        text_parts.append(attr_result["title"])
+                                    if attr_result.get("snippet"):
+                                        text_parts.append(attr_result["snippet"])
+                                    if attr_result.get("displayLink"):
+                                        text_parts.append(attr_result["displayLink"])
+                                    
+                                    text = "\n".join(text_parts)
+                                    
+                                    if verbose:
+                                        print(f"\033[34mExtracting from text:\n{text}\033[0m\n")
+                                    
+                                    extracted = await gemini.parse_search_result(
+                                        text,
+                                        entity_type,
+                                        [attr]
+                                    )
+                                    if extracted and attr in extracted:
+                                        result[attr] = extracted[attr]
+                                        # Update global results in case of interrupt
+                                        _current_results = results
+                                        break  # Found the attribute, move to next one
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"\033[31mError extracting {attr}: {str(e)}\033[0m\n")
+                                    continue
+                        except Exception as e:
+                            if verbose:
+                                print(f"\033[31mError searching for {attr}: {str(e)}\033[0m\n")
                 
                 process_progress.update(second_pass, advance=1)
     
-    # Write results
-    if results:
-        write_results(results, fmt=output_format, file=output_file)
-        status_console.print(f"[green]Wrote {len(results)} results[/green]")
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
+    finally:
+        # Write results if we have any
+        if results:
+            write_results(results, fmt=output_format, file=output_file)
+            status_console.print(f"[green]Wrote {len(results)} results[/green]")
 
 # Expose the Typer app as main for the Poetry script
 main = app

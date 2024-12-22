@@ -15,7 +15,7 @@ from .rate_limiter import RateLimiter
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    MODEL_NAME = "gemini-pro"
+    MODEL_NAME = "gemini-2.0-flash-exp"
     
     def __init__(self, temperature: float = 0.7, verbose: bool = False):
         """Initialize the Gemini client.
@@ -38,7 +38,7 @@ class GeminiClient:
         
         # Configure the Gemini API
         genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel(self.MODEL_NAME)  # Use MODEL_NAME class constant
     
     async def _generate_with_retry(self, prompt: str) -> str:
         """Generate text with retries and rate limiting."""
@@ -50,7 +50,8 @@ class GeminiClient:
             return response.text
             
         try:
-            return await self.rate_limiter.execute(_generate)
+            result = await self.rate_limiter.execute(_generate)
+            return result
         except Exception as e:
             if self.verbose:
                 print(f"\n[Error] Generation failed: {str(e)}")
@@ -73,9 +74,6 @@ class GeminiClient:
             
             return json.loads(text)
         except json.JSONDecodeError as e:
-            if self.verbose:
-                print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {text}")
             raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
     
     def _clean_json_text(self, text: str) -> str:
@@ -91,7 +89,7 @@ class GeminiClient:
         """Parse a query to extract entities, attributes, and search space.
         
         Returns:
-            Tuple of (entity_type, list of attributes, search space)
+            Tuple of (entity_type, list of attributes, search_space)
         """
         prompt = f"""Given this search query, extract:
 1. The entity type we're searching for
@@ -124,7 +122,7 @@ Return ONLY a JSON object with "entity", "attributes", and "search_space" fields
 
 Query: "{query}"
 """
-        try:
+        async def _parse():
             result = await self._generate_and_parse_json(prompt)
             if not result or "entity" not in result or "attributes" not in result or "search_space" not in result:
                 raise ValueError("Missing required fields in query parsing result")
@@ -134,6 +132,9 @@ Query: "{query}"
                 print(json.dumps(result, indent=4))
             
             return result["entity"], result["attributes"], result["search_space"]
+            
+        try:
+            return await self.rate_limiter.execute(_parse)
         except Exception as e:
             if self.verbose:
                 print(f"\n[Error] Failed to parse query: {str(e)}")
@@ -251,7 +252,7 @@ Query: "{search_space}"
             if self.verbose:
                 print(f"\n[Error] Failed to enumerate search space: {str(e)}")
             raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
-    
+
     def _build_extraction_prompt(self, text: str, entity_type: str, attributes: List[str]) -> str:
         """Build a prompt for extracting attributes from text."""
         if "name" in attributes and len(attributes) == 1:
@@ -272,27 +273,52 @@ Title to analyze:
 
 Return ONLY the JSON object, no other text:"""
         else:
-            # Normal case for extracting attributes from text
-            return f"""Extract information about {entity_type} from this text. Return ONLY a JSON object with these fields: {', '.join(attributes)}.
+            # Build prompt based on requested attributes
+            prompt = f"""Extract information about {entity_type} from this text. Return ONLY a JSON object with these fields: {', '.join(attributes)}.
 If you cannot find valid information for the requested entity type, return an empty object {{}}.
 
-Here are the requirements for each field:
-- name: The full name of the {entity_type}
-- address: A complete address with street, city, and state
+Here are the requirements for each field:"""
 
-Example valid outputs:
-{{
+            for attr in attributes:
+                if attr == "name":
+                    prompt += """
+- name: The full name of the entity"""
+                elif attr == "address":
+                    prompt += """
+- address: {
+    "street_address": "Full street number and name (e.g., '123 Main St')",
+    "city": "City name only (e.g., 'Boston')",
+    "state": "State abbreviation (e.g., 'MA')",
+    "zip_code": "5-digit ZIP code (e.g., '02108')"
+  }"""
+
+            prompt += """
+
+Example outputs:
+{
     "name": "Elite Fitness Center",
-    "address": "123 Main Street, Boston, MA 02108"
-}}
+    "address": {
+        "street_address": "123 Main Street",
+        "city": "Boston",
+        "state": "MA",
+        "zip_code": "02108"
+    }
+}
 
-or if no valid information is found:
-{{}}
+or with partial address:
+{
+    "name": "Downtown Gym",
+    "address": {
+        "city": "Portland",
+        "state": "ME"
+    }
+}
 
 Text to analyze:
 {text}
 
 Return ONLY the JSON object, no other text:"""
+            return prompt
     
     async def parse_search_result(self, text: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, Any]]:
         """Parse search result text into structured data based on requested attributes."""
@@ -309,10 +335,27 @@ Return ONLY the JSON object, no other text:"""
                     # For other attributes, show all extracted data
                     else:
                         for attr, value in result.items():
-                            print(f'{attr}: "{value}"')
+                            if attr == "address" and isinstance(value, dict):
+                                # Format address components
+                                components = []
+                                if value.get("street_address"):
+                                    components.append(value["street_address"])
+                                if value.get("city"):
+                                    components.append(value["city"])
+                                if value.get("state"):
+                                    components.append(value["state"])
+                                if value.get("zip_code"):
+                                    components.append(value["zip_code"])
+                                print(f'address: "{", ".join(components)}"')
+                            else:
+                                print(f'{attr}: "{value}"')
                 else:
                     print("[No Data Extracted]")
                 print()  # Add blank line for readability
+            
+            # Convert address dict to Address model if present
+            if result and "address" in result and isinstance(result["address"], dict):
+                result["address"] = Address(**result["address"])
                 
             return result if result else None
         except Exception as e:
