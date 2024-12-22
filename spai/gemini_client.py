@@ -39,14 +39,16 @@ class GeminiClient:
         genai.configure(api_key=self.api_key)
         
         # Set up the model with generation config
+        generation_config = {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "max_output_tokens": max_output_tokens,
+        }
+        
         self.model = genai.GenerativeModel(
             model_name=self.MODEL_NAME,
-            generation_config=genai.types.GenerationConfig(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-            )
+            generation_config=generation_config
         )
     
     async def parse_query(self, query: str) -> SearchQuery:
@@ -89,7 +91,7 @@ class GeminiClient:
         """
         
         try:
-            response = await self.model.aio.generate_content(prompt)
+            response = await self.model.generate_content_async(prompt)
             data = json.loads(response.text)
             return SearchQuery(**data)
         except json.JSONDecodeError as e:
@@ -146,7 +148,7 @@ class GeminiClient:
         """
         
         try:
-            response = await self.model.aio.generate_content(prompt)
+            response = await self.model.generate_content_async(prompt)
             return json.loads(response.text)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
@@ -168,7 +170,7 @@ class GeminiClient:
         """
         
         try:
-            response = await self.model.aio.generate_content(prompt)
+            response = await self.model.generate_content_async(prompt)
             return json.loads(response.text)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
