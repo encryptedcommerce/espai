@@ -306,46 +306,85 @@ async def async_main(
         expand=True,
         transient=False
     ) as process_progress:
-        process_task = process_progress.add_task(
-            description="[cyan]Processing results...",
+        # First pass: Extract names from search results
+        first_pass = process_progress.add_task(
+            description="[cyan]Starting name extraction...",
             total=len(all_search_results)
         )
-        
-        for idx, result in enumerate(all_search_results, 1):
-            if should_shutdown:
-                break
+
+        for idx, result in enumerate(all_search_results):
+            title = result.get('title', 'Untitled')
+            # Truncate and pad title to fixed width of 50 chars
+            display_title = f"{title[:47]}..." if len(title) > 50 else title.ljust(50)
             
-            title = result.get('title', 'Untitled')[:40]
             process_progress.update(
-                process_task,
-                description=f"[cyan]Processing {idx}/{len(all_search_results)}: {title}..."
+                first_pass,
+                description=f"[cyan]Extracting from {idx+1}/{len(all_search_results)}: {display_title}"
             )
             
             if verbose:
-                print(f"\033[34mProcessing: {title}\033[0m")
+                print(f"\033[34mExtracting from: {title}\033[0m")
             
             try:
-                # Extract snippet or full text
-                text = result.get("snippet", "") or result.get("text", "")
-                if not text:
-                    continue
-                
-                # Parse with Gemini
-                extracted = await gemini.parse_search_result(text, entity_type, attributes)
-                if not extracted:
-                    if verbose:
-                        print("\033[33mNo data extracted from result\033[0m")
-                    continue
-                
-                results.append(extracted)
-                
-                # Update global results in case of interrupt
-                _current_results = results
+                # First pass: extract name from title
+                extracted = await gemini.parse_search_result(title, entity_type, ["name"])
+                if extracted and "name" in extracted:
+                    results.append({"name": extracted["name"]})
+                    # Update global results in case of interrupt
+                    _current_results = results
             except Exception as e:
                 if verbose:
-                    print(f"\033[31mError processing result: {str(e)}\033[0m")
+                    print(f"\033[31mError extracting name: {str(e)}\033[0m\n")
+            finally:
+                # Always update progress, even if no name was extracted
+                process_progress.update(first_pass, advance=1)
+        
+        # Second pass: Search for and extract attributes
+        remaining_attributes = [attr for attr in attributes if attr != "name"]
+        if remaining_attributes and results:
+            second_pass = process_progress.add_task(
+                description="[cyan]Gathering attributes...",
+                total=len(results)
+            )
             
-            process_progress.update(process_task, advance=1)
+            for idx, result in enumerate(results):
+                if should_shutdown:
+                    break
+                
+                name = result["name"]
+                process_progress.update(
+                    second_pass,
+                    description=f"[cyan]Gathering attributes for {idx+1}/{len(results)}: {name[:40]}..."
+                )
+                
+                if verbose:
+                    print(f"\033[34mGathering attributes for: {name}\033[0m")
+                
+                try:
+                    # Search specifically for this entity's attributes
+                    attr_results = await search.search(f'"{name}"')
+                    if not attr_results:
+                        continue
+                    
+                    # Extract attributes from the new search results
+                    for attr_result in attr_results[:3]:  # Try top 3 results
+                        text = attr_result.get("snippet", "") or attr_result.get("text", "")
+                        if not text:
+                            continue
+                        
+                        extracted = await gemini.parse_search_result(text, entity_type, remaining_attributes)
+                        if extracted:
+                            # Update the result with any found attributes
+                            for attr in remaining_attributes:
+                                if attr in extracted:
+                                    result[attr] = extracted[attr]
+                            break  # Stop if we found attributes
+                    
+                except Exception as e:
+                    if verbose:
+                        print(f"\033[31mError gathering attributes: {str(e)}\033[0m")
+                
+                process_progress.update(second_pass, advance=1)
     
     # Write results
     if results:

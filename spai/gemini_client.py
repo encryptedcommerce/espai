@@ -254,7 +254,26 @@ Query: "{search_space}"
     
     def _build_extraction_prompt(self, text: str, entity_type: str, attributes: List[str]) -> str:
         """Build a prompt for extracting attributes from text."""
-        prompt = f"""Extract information about {entity_type} from this text. Return ONLY a JSON object with these fields: {', '.join(attributes)}.
+        if "name" in attributes and len(attributes) == 1:
+            # Special case for extracting name from title
+            return f"""Extract the name of the {entity_type} from this title. Return ONLY a JSON object with the "name" field.
+If this title does not appear to be a {entity_type}, return an empty object {{}}.
+
+Example valid outputs for "{entity_type}":
+{{
+    "name": "Elite Fitness Center"
+}}
+
+or if not a {entity_type}:
+{{}}
+
+Title to analyze:
+{text}
+
+Return ONLY the JSON object, no other text:"""
+        else:
+            # Normal case for extracting attributes from text
+            return f"""Extract information about {entity_type} from this text. Return ONLY a JSON object with these fields: {', '.join(attributes)}.
 If you cannot find valid information for the requested entity type, return an empty object {{}}.
 
 Here are the requirements for each field:
@@ -274,29 +293,31 @@ Text to analyze:
 {text}
 
 Return ONLY the JSON object, no other text:"""
-        return prompt
     
     async def parse_search_result(self, text: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, Any]]:
         """Parse search result text into structured data based on requested attributes."""
         try:
-            if self.verbose:
-                print(f"\n[Search Result]:")
-                print(text[:200] + "..." if len(text) > 200 else text)
-            
             result = await self._generate_and_parse_json(
                 self._build_extraction_prompt(text, entity_type, attributes)
             )
             
-            if self.verbose and result:
-                print("\n[Extracted Data]:")
-                print(json.dumps(result, indent=2))
-            elif self.verbose:
-                print("[No Data Extracted]")
+            if self.verbose:
+                if result:
+                    # For name extraction, just show the name
+                    if len(attributes) == 1 and "name" in attributes and "name" in result:
+                        print(f'name: "{result["name"]}"')
+                    # For other attributes, show all extracted data
+                    else:
+                        for attr, value in result.items():
+                            print(f'{attr}: "{value}"')
+                else:
+                    print("[No Data Extracted]")
+                print()  # Add blank line for readability
                 
             return result if result else None
         except Exception as e:
             if self.verbose:
-                print(f"\n[Error] Failed to parse search result: {str(e)}")
+                print(f"[Error] Failed to parse search result: {str(e)}\n")
             return None
     
     async def extract_attribute(self, entity_name: str, attribute: str, text: str) -> Optional[dict]:
