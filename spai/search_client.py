@@ -1,16 +1,16 @@
 """Google Search API client for performing searches."""
 
 import os
-from typing import List, Optional
+from typing import List, Dict, Optional
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from .rate_limiter import RateLimiter, with_exponential_backoff
+from .rate_limiter import RateLimiter
 
 
 class GoogleSearchClient:
-    """Client for performing Google searches."""
+    """Client for Google Custom Search API."""
     
     def __init__(
         self,
@@ -29,7 +29,11 @@ class GoogleSearchClient:
             
         self.max_results = max_results
         self.service = build("customsearch", "v1", developerKey=self.api_key)
-        self.rate_limiter = RateLimiter(min_delay=1.0)  # 1 request per second
+        self.rate_limiter = RateLimiter(
+            base_delay=0.5,  # 0.5 second between requests
+            max_delay=32.0,  # Max 32 second delay
+            max_retries=6    # Up to 6 retries
+        )
     
     async def _execute_search(self, query: str, start_index: int) -> dict:
         """Execute a single search request with retries."""
@@ -46,26 +50,28 @@ class GoogleSearchClient:
             max_delay=64.0
         )
     
-    async def search(self, query: str) -> List[dict]:
-        """Perform a Google search and return results."""
+    async def search(self, query: str) -> List[Dict[str, str]]:
+        """Search using Google Custom Search API."""
+        async def _search():
+            service = build(
+                "customsearch", "v1",
+                developerKey=self.api_key,
+                static_discovery=False
+            )
+            
+            try:
+                result = service.cse().list(
+                    q=query,
+                    cx=self.cse_id,
+                    num=self.max_results
+                ).execute()
+                
+                return result.get("items", [])
+            finally:
+                service.close()
+        
         try:
-            results = []
-            start_index = 1
-            
-            while len(results) < self.max_results:
-                response = await self._execute_search(query, start_index)
-                
-                if "items" not in response:
-                    break
-                    
-                results.extend(response["items"])
-                if len(response["items"]) < 10:  # Less than a full page
-                    break
-                    
-                start_index += 10
-                
-            return results[:self.max_results]
-            
-        except HttpError as e:
-            print(f"Error performing Google search: {e}")
+            return await self.rate_limiter.execute(_search)
+        except Exception as e:
+            print(f"Error searching: {str(e)}")
             return []

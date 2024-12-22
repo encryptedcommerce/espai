@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import google.generativeai as genai
 
 from .models import SearchQuery, EntityResult, Address, Contact, Hours
-from .rate_limiter import RateLimiter, with_exponential_backoff
+from .rate_limiter import RateLimiter
 
 
 class GeminiClient:
@@ -17,55 +17,46 @@ class GeminiClient:
     
     MODEL_NAME = "gemini-pro"
     
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        temperature: float = 0.1,
-        top_k: int = 1,
-        top_p: float = 0.8,
-        max_output_tokens: int = 1024,
-        verbose: bool = False,
-    ):
-        """Initialize the Gemini client."""
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+    def __init__(self, temperature: float = 0.7, verbose: bool = False):
+        """Initialize the Gemini client.
+        
+        Args:
+            temperature: Temperature for generation (0.0 to 1.0)
+            verbose: Whether to print debug information
+        """
+        self.api_key = os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Gemini API key not provided")
         
         self.verbose = verbose
-        self.rate_limiter = RateLimiter(min_delay=1.0)  # 1 request per second
+        self.temperature = temperature
+        self.rate_limiter = RateLimiter(
+            base_delay=0.5,  # 0.5 second between requests
+            max_delay=32.0,  # Max 32 second delay
+            max_retries=6    # Up to 6 retries
+        )
         
         # Configure the Gemini API
         genai.configure(api_key=self.api_key)
-        
-        # Set up the model with generation config
-        generation_config = {
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-            "max_output_tokens": max_output_tokens,
-        }
-        
-        self.model = genai.GenerativeModel(
-            model_name=self.MODEL_NAME,
-            generation_config=generation_config
-        )
+        self.model = genai.GenerativeModel('gemini-pro')
     
-    async def _generate_with_retry(self, prompt: str, max_retries: int = 6) -> str:
-        """Generate content with retry logic for rate limiting."""
-        await self.rate_limiter.wait()
-        
-        response = await with_exponential_backoff(
-            self.model.generate_content,
-            prompt,
-            max_retries=max_retries,
-            base_delay=2.0,
-            max_delay=64.0
-        )
-        
-        if self.verbose:
-            print(f"Raw response text: {response.text}")
-        
-        return response.text
+    async def _generate_with_retry(self, prompt: str) -> str:
+        """Generate text with retries and rate limiting."""
+        async def _generate():
+            response = await self.model.generate_content_async(
+                prompt,
+                generation_config={"temperature": self.temperature}
+            )
+            if self.verbose:
+                print(f"Raw response text: {response.text}")
+            return response.text
+            
+        try:
+            return await self.rate_limiter.execute(_generate)
+        except Exception as e:
+            if self.verbose:
+                print(f"Error generating content: {str(e)}")
+            raise
     
     async def _generate_and_parse_json(self, prompt: str) -> Any:
         """Generate content and parse it as JSON."""
