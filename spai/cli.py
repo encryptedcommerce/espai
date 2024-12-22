@@ -1,7 +1,9 @@
 """Command line interface for SPAI."""
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import List, Optional
 
 import polars as pl
@@ -12,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .gemini_client import GeminiClient
-from .models import SearchQuery
+from .models import SearchQuery, EntityResult
 from .search_client import GoogleSearchClient
 
 # Load environment variables
@@ -35,7 +37,7 @@ app = typer.Typer(
     
     Example Usage:
         $ spai search "Find coffee shops with good ratings in Seattle"
-        $ spai search "List gyms with their hours in New York" --max-results 5
+        $ spai search "List gyms with their hours in New York" --max-results 5 --format csv
         $ spai search "Show me restaurants in San Francisco" --format json
     
     Note: Always wrap your query in quotes when it contains spaces:
@@ -86,8 +88,13 @@ def search(
     output_format: str = typer.Option(
         "table",
         "--format", "-f",
-        help="Output format: table or json",
+        help="Output format: table, json, or csv",
         case_sensitive=False,
+    ),
+    output_file: Optional[str] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Output file path. If not specified, output is written to stdout.",
     ),
     temperature: float = typer.Option(
         0.1,
@@ -110,12 +117,19 @@ def search(
     
     Examples:
         $ spai search "Find coffee shops with good ratings in Seattle"
-        $ spai search "List gyms with their hours in New York" --max-results 5
+        $ spai search "List gyms with their hours in New York" --max-results 5 --format csv
         $ spai search "Show me restaurants in San Francisco" --format json
     """
     try:
         # Run the async main function
-        asyncio.run(async_main(query, max_results, output_format, temperature, verbose))
+        asyncio.run(async_main(
+            query=query,
+            max_results=max_results,
+            output_format=output_format,
+            output_file=output_file,
+            temperature=temperature,
+            verbose=verbose,
+        ))
     except Exception as e:
         console.print(f"[red]Error: {str(e)}[/red]")
         raise typer.Exit(1)
@@ -124,6 +138,7 @@ async def async_main(
     query: str,
     max_results: int,
     output_format: str,
+    output_file: Optional[str],
     temperature: float,
     verbose: bool,
 ) -> None:
@@ -173,7 +188,7 @@ async def async_main(
                     result["snippet"],
                     query_struct.entity_attributes
                 )
-                results.append(extracted)
+                results.append(extracted.to_flat_dict(set(query_struct.entity_attributes)))
             except Exception as e:
                 if verbose:
                     console.print(f"[red]Failed to process result: {str(e)}[/red]")
@@ -182,22 +197,47 @@ async def async_main(
     if results:
         df = pl.DataFrame(results)
         
-        if output_format.lower() == "json":
-            # Output as JSON
-            console.print_json(df.to_dict(as_series=False))
-        else:
-            # Create a rich table
+        # Preview results in table format (limited to 20 rows)
+        if len(df) > 0:
             table = Table(show_header=True, header_style="bold magenta")
             
             # Add columns
             for col in df.columns:
                 table.add_column(col)
             
-            # Add rows
-            for row in df.rows():
+            # Add rows (limited to 20)
+            for row in df.head(20).rows():
                 table.add_row(*[str(cell) for cell in row])
             
+            console.print("\n[bold]Preview of results:[/bold]")
             console.print(table)
+            
+            if len(df) > 20:
+                console.print(f"\n[dim]... and {len(df) - 20} more rows[/dim]")
+        
+        # Write output in requested format
+        output_format = output_format.lower()
+        if output_file:
+            # Create output directory if it doesn't exist
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            if output_format == "json":
+                with open(output_file, "w") as f:
+                    json.dump(df.to_dict(as_series=False), f, indent=2)
+            elif output_format == "csv":
+                df.write_csv(output_file)
+            else:
+                console.print(f"[red]Unsupported output format for file: {output_format}[/red]")
+                return
+            
+            console.print(f"[green]Results written to: {output_file}[/green]")
+        else:
+            if output_format == "json":
+                console.print_json(df.to_dict(as_series=False))
+            elif output_format == "csv":
+                console.print(df.write_csv())
+            # Table format is already shown in preview
     else:
         console.print("[red]No structured data could be extracted[/red]")
 

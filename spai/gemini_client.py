@@ -6,13 +6,13 @@ from typing import Dict, List, Optional
 
 import google.generativeai as genai
 
-from .models import SearchQuery
+from .models import SearchQuery, EntityResult, Address, Contact, Hours
 
 
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    MODEL_NAME = "gemini-pro"  # Using the correct model name
+    MODEL_NAME = "gemini-pro"
     
     def __init__(
         self,
@@ -93,9 +93,9 @@ class GeminiClient:
             # Clean the response text to ensure it's valid JSON
             text = response.text.strip()
             if text.startswith('```json'):
-                text = text[7:]  # Remove ```json prefix
+                text = text[7:]
             if text.endswith('```'):
-                text = text[:-3]  # Remove ``` suffix
+                text = text[:-3]
             text = text.strip()
             
             data = json.loads(text)
@@ -111,52 +111,59 @@ class GeminiClient:
                 print(f"Response text: {response.text}")
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
-    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Dict:
+    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> EntityResult:
         """Parse search result text into structured data based on requested attributes."""
-        # Create a dynamic instruction for each attribute
-        attribute_instructions = []
-        for attr in entity_attributes:
-            if attr == "address":
-                attribute_instructions.append(
-                    '- address: {\n'
-                    '    street_address: Full street address\n'
-                    '    city: City name\n'
-                    '    state: State name\n'
-                    '    zip_code: ZIP or postal code\n'
-                    '  }'
-                )
-            elif attr == "contact":
-                attribute_instructions.append(
-                    '- contact: {\n'
-                    '    phone: Phone number\n'
-                    '    email: Email address\n'
-                    '  }'
-                )
-            elif attr == "hours":
-                attribute_instructions.append(
-                    '- hours: {\n'
-                    '    monday: Operating hours for Monday\n'
-                    '    tuesday: Operating hours for Tuesday\n'
-                    '    wednesday: Operating hours for Wednesday\n'
-                    '    thursday: Operating hours for Thursday\n'
-                    '    friday: Operating hours for Friday\n'
-                    '    saturday: Operating hours for Saturday\n'
-                    '    sunday: Operating hours for Sunday\n'
-                    '  }'
-                )
-            else:
-                # For simple attributes, just add them directly
-                attribute_instructions.append(f'- {attr}: Relevant {attr} information from the text')
-        
         prompt = f"""
         Extract structured information from the following text:
         {text}
         
         Return a valid JSON object with these fields where available:
-        {chr(10).join(attribute_instructions)}
+        - name: Entity name or title
+        """
+        
+        # Add specific field instructions based on requested attributes
+        if "address" in entity_attributes:
+            prompt += """
+        - address:
+            street_address: Full street address
+            city: City name
+            state: State name
+            zip_code: ZIP or postal code"""
+        
+        if "contact" in entity_attributes:
+            prompt += """
+        - contact:
+            phone: Phone number
+            email: Email address"""
+        
+        if "hours" in entity_attributes:
+            prompt += """
+        - hours:
+            monday: Operating hours for Monday
+            tuesday: Operating hours for Tuesday
+            wednesday: Operating hours for Wednesday
+            thursday: Operating hours for Thursday
+            friday: Operating hours for Friday
+            saturday: Operating hours for Saturday
+            sunday: Operating hours for Sunday"""
+        
+        if "rating" in entity_attributes:
+            prompt += "\n        - rating: Rating information (e.g., '4.5 stars')"
+        
+        if "website" in entity_attributes:
+            prompt += "\n        - website: Website URL"
+        
+        if "price" in entity_attributes:
+            prompt += "\n        - price: Price range or cost information"
+        
+        if "description" in entity_attributes:
+            prompt += "\n        - description: General description or details"
+        
+        prompt += """
         
         Ensure the response is ONLY the JSON object, with no additional text.
         If a field is not found in the text, omit it from the JSON rather than including null or empty values.
+        Format addresses consistently, e.g., '123 Main St, City, State 12345'
         """
         
         try:
@@ -167,12 +174,22 @@ class GeminiClient:
             # Clean the response text to ensure it's valid JSON
             text = response.text.strip()
             if text.startswith('```json'):
-                text = text[7:]  # Remove ```json prefix
+                text = text[7:]
             if text.endswith('```'):
-                text = text[:-3]  # Remove ``` suffix
+                text = text[:-3]
             text = text.strip()
             
-            return json.loads(text)
+            data = json.loads(text)
+            
+            # Convert nested dictionaries to proper models
+            if "address" in data and isinstance(data["address"], dict):
+                data["address"] = Address(**data["address"])
+            if "contact" in data and isinstance(data["contact"], dict):
+                data["contact"] = Contact(**data["contact"])
+            if "hours" in data and isinstance(data["hours"], dict):
+                data["hours"] = Hours(**data["hours"])
+            
+            return EntityResult(**data)
         except json.JSONDecodeError as e:
             if self.verbose:
                 print(f"JSON decode error at position {e.pos}")
@@ -206,9 +223,9 @@ class GeminiClient:
             # Clean the response text to ensure it's valid JSON
             text = response.text.strip()
             if text.startswith('```json'):
-                text = text[7:]  # Remove ```json prefix
+                text = text[7:]
             if text.endswith('```'):
-                text = text[:-3]  # Remove ``` suffix
+                text = text[:-3]
             text = text.strip()
             
             return json.loads(text)
