@@ -3,12 +3,13 @@
 import asyncio
 import json
 import os
-from typing import Dict, List, Optional, Set
+import re
+from typing import Dict, List, Optional, Any, Tuple
 
 import google.generativeai as genai
-from google.api_core import retry
 
 from .models import SearchQuery, EntityResult, Address, Contact, Hours
+from .rate_limiter import RateLimiter, with_exponential_backoff
 
 
 class GeminiClient:
@@ -31,6 +32,7 @@ class GeminiClient:
             raise ValueError("Gemini API key not provided")
         
         self.verbose = verbose
+        self.rate_limiter = RateLimiter(min_delay=1.0)  # 1 request per second
         
         # Configure the Gemini API
         genai.configure(api_key=self.api_key)
@@ -48,24 +50,44 @@ class GeminiClient:
             generation_config=generation_config
         )
     
-    async def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
+    async def _generate_with_retry(self, prompt: str, max_retries: int = 6) -> str:
         """Generate content with retry logic for rate limiting."""
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                response = await self.model.generate_content_async(prompt)
+        await self.rate_limiter.wait()
+        
+        response = await with_exponential_backoff(
+            self.model.generate_content,
+            prompt,
+            max_retries=max_retries,
+            base_delay=2.0,
+            max_delay=64.0
+        )
+        
+        if self.verbose:
+            print(f"Raw response text: {response.text}")
+        
+        return response.text
+    
+    async def _generate_and_parse_json(self, prompt: str) -> Any:
+        """Generate content and parse it as JSON."""
+        try:
+            text = await self._generate_with_retry(prompt)
+            text = self._clean_json_text(text)
+            
+            # Check for truncation
+            if text.count('[') != text.count(']'):
                 if self.verbose:
-                    print(f"Raw response text: {response.text}")
-                return response.text
-            except Exception as e:
-                if "429" in str(e) and retry_count < max_retries - 1:
-                    retry_count += 1
-                    wait_time = 2 ** retry_count  # Exponential backoff
-                    if self.verbose:
-                        print(f"Rate limited, waiting {wait_time}s before retry {retry_count + 1}/{max_retries}")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise
+                    print("Warning: Response appears to be truncated")
+                # Try to fix truncated array by finding last complete item
+                last_comma = text.rfind(',')
+                if last_comma != -1:
+                    text = text[:last_comma] + ']'
+            
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            if self.verbose:
+                print(f"JSON decode error at position {e.pos}")
+                print(f"Response text: {text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
     
     def _clean_json_text(self, text: str) -> str:
         """Clean text to ensure it's valid JSON."""
@@ -76,162 +98,179 @@ class GeminiClient:
             text = text[:-3]
         return text.strip()
     
-    async def parse_query(self, query: str) -> SearchQuery:
-        """Parse a natural language query into structured components."""
-        prompt = f"""
-        Parse the following search query into structured components:
-        Query: "{query}"
+    async def parse_query(self, query: str) -> Tuple[str, List[str], str]:
+        """Parse a query to extract entities, attributes, and search space.
         
-        Return a valid JSON object with these fields:
-        - entities: The main target entities to search for (e.g., "athletic centers", "restaurants")
-        - entity_attributes: List of attributes to extract. Common attributes include:
-          * name (entity name)
-          * address (full address with street, city, state, zip)
-          * contact (phone, email)
-          * hours (business hours)
-          * rating (customer ratings)
-          * website (website URL)
-          * price (price range or costs)
-          * description (general description)
-          Extract ANY attributes that are explicitly mentioned or strongly implied by the query.
-        - search_space: The space to search within (e.g., "all California zip codes", "top 10 US cities")
-        
-        Example 1:
-        Query: "Find gyms with good ratings and contact info in New York"
-        {{
-            "entities": "gyms",
-            "entity_attributes": ["name", "rating", "contact", "address"],
-            "search_space": "New York"
-        }}
-        
-        Example 2:
-        Query: "List coffee shops and their business hours in Seattle"
-        {{
-            "entities": "coffee shops",
-            "entity_attributes": ["name", "hours", "address"],
-            "search_space": "Seattle"
-        }}
-        
-        Ensure the response is ONLY the JSON object, with no additional text.
+        Returns:
+            Tuple of (entity_type, list of attributes, search space)
         """
-        
+        prompt = f"""Given this search query, extract:
+1. The entity type we're searching for
+2. The attributes we want to extract for each entity
+3. The search space we need to enumerate
+
+For example:
+Query: "athletic center names and addresses in all AZ zip codes"
+{{
+    "entity": "athletic centers",
+    "attributes": ["name", "address"],
+    "search_space": "all AZ zip codes"
+}}
+
+Query: "coffee shops in all US States"
+{{
+    "entity": "coffee shops",
+    "attributes": ["name"],
+    "search_space": "all US States"
+}}
+
+Query: "Find gyms with good ratings and contact info in New York"
+{{
+    "entity": "gyms",
+    "attributes": ["name", "rating", "contact"],
+    "search_space": "New York"
+}}
+
+Return ONLY a JSON object with "entity", "attributes", and "search_space" fields, no other text.
+
+Query: "{query}"
+"""
         try:
-            text = await self._generate_with_retry(prompt)
-            text = self._clean_json_text(text)
+            result = await self._generate_and_parse_json(prompt)
+            if not result or "entity" not in result or "attributes" not in result or "search_space" not in result:
+                raise ValueError("Missing required fields in query parsing result")
             
-            data = json.loads(text)
-            return SearchQuery(**data)
-        except json.JSONDecodeError as e:
-            if self.verbose:
-                print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {text}")
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
+            return result["entity"], result["attributes"], result["search_space"]
         except Exception as e:
             if self.verbose:
                 print(f"Error parsing query: {str(e)}")
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
-    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Optional[EntityResult]:
-        """Parse search result text into structured data based on requested attributes."""
-        prompt = f"""
-        You are an expert at extracting structured information from text.
+    async def enumerate_search_space(self, search_space: str) -> List[str]:
+        """Convert a search space description into a list of specific items to search.
         
-        Extract relevant information from this text:
-        ---
-        {text}
-        ---
-        
-        Look carefully for:
-        1. The name of the entity
-        2. Any other requested attributes
-        
-        Return a valid JSON object with these fields:
-        - name: The official or primary name of the entity
-        """
-        
-        # Add specific field instructions based on requested attributes
-        if "address" in entity_attributes:
-            prompt += """
-        - address: {
-            street_address: The street number and name (e.g., "123 Main St"),
-            city: City name only (e.g., "Los Angeles"),
-            state: State abbreviation (e.g., "CA"),
-            zip_code: 5-digit ZIP code (e.g., "90210")
-          }
-          Note: Include any address components you find, even if incomplete."""
-        
-        if "contact" in entity_attributes:
-            prompt += """
-        - contact: {
-            phone: Full phone number with area code,
-            email: Complete email address
-          }"""
-        
-        if "hours" in entity_attributes:
-            prompt += """
-        - hours: {
-            monday: Hours in format "9:00 AM - 5:00 PM",
-            tuesday: Hours in format "9:00 AM - 5:00 PM",
-            wednesday: Hours in format "9:00 AM - 5:00 PM",
-            thursday: Hours in format "9:00 AM - 5:00 PM",
-            friday: Hours in format "9:00 AM - 5:00 PM",
-            saturday: Hours in format "9:00 AM - 5:00 PM",
-            sunday: Hours in format "9:00 AM - 5:00 PM"
-          }"""
-        
-        if "rating" in entity_attributes:
-            prompt += "\n        - rating: Rating out of 5 stars (e.g., '4.5 stars' or '4.5/5')"
-        
-        if "website" in entity_attributes:
-            prompt += "\n        - website: Complete URL starting with http:// or https://"
-        
-        if "price" in entity_attributes:
-            prompt += "\n        - price: Price range (e.g., '$', '$$', '$$$') or specific costs"
-        
-        if "description" in entity_attributes:
-            prompt += "\n        - description: Brief description of the entity and its offerings"
-        
-        prompt += """
-        
-        Important:
-        1. Return ONLY the JSON object
-        2. Include ONLY fields where you found information
-        3. If you can't find a name or any relevant information, return an empty object {}
-        4. For addresses, include any components you find, even if the address is incomplete
-        5. Don't make up or guess at any information - only include what's explicitly in the text
-        
-        Example good response for partial information:
-        {
-          "name": "LA Fitness Downtown",
-          "address": {
-            "city": "Los Angeles",
-            "state": "CA"
-          }
-        }
-        """
-        
-        try:
-            text = await self._generate_with_retry(prompt)
-            text = self._clean_json_text(text)
+        Args:
+            search_space: Description of the search space (e.g., "all AZ zip codes")
             
-            data = json.loads(text)
-            if not data or "name" not in data:  # Must at least have a name
-                return None
+        Returns:
+            List of specific items to search (e.g., ["85001", "85002", ...])
+        """
+        # For zip codes, break down by region first
+        if "zip codes" in search_space.lower():
+            try:
+                regions_prompt = f"""Break down this search space into regions that we can enumerate separately.
+Return ONLY a JSON array of region descriptions. Each region should cover a specific range of zip codes.
+
+For example:
+Query: "all California zip codes"
+[
+  "Los Angeles County (900xx-904xx)",
+  "Orange County (905xx-908xx)", 
+  "San Francisco Bay Area (940xx-944xx)",
+  "San Diego County (919xx-921xx)",
+  "Sacramento Area (956xx-957xx)",
+  "Central Valley North (932xx-934xx)",
+  "Central Valley South (935xx-937xx)",
+  "Inland Empire (917xx-918xx, 923xx-925xx)",
+  "North Coast (954xx-955xx, 959xx-960xx)",
+  "Central Coast (934xx-935xx, 939xx-940xx)"
+]
+
+Query: "{search_space}"
+"""
+                regions = await self._generate_and_parse_json(regions_prompt)
+                if not regions or not isinstance(regions, list) or len(regions) == 0:
+                    raise ValueError("Failed to get valid regions list")
                 
-            # Convert nested dictionaries to proper models
-            if "address" in data and isinstance(data["address"], dict):
-                data["address"] = Address(**data["address"])
-            if "contact" in data and isinstance(data["contact"], dict):
-                data["contact"] = Contact(**data["contact"])
-            if "hours" in data and isinstance(data["hours"], dict):
-                data["hours"] = Hours(**data["hours"])
+                all_items = []
+                for region in regions:
+                    if self.verbose:
+                        print(f"Enumerating region: {region}")
+                    
+                    # Extract zip code range from region description
+                    matches = re.findall(r'(\d{3})xx-(\d{3})xx', region)
+                    if matches:
+                        for start_prefix, end_prefix in matches:
+                            start = int(start_prefix + "00")
+                            end = int(end_prefix + "99")
+                            all_items.extend([f"{i:05d}" for i in range(start, end + 1)])
+                    else:
+                        # If no range found, ask Gemini for the zip codes
+                        region_prompt = f"""List ALL zip codes in this region: {region}
+Return ONLY a JSON array of 5-digit zip code strings. Format each zip code as a 5-digit string with leading zeros."""
+                        
+                        try:
+                            items = await self._generate_and_parse_json(region_prompt)
+                            if items and isinstance(items, list):
+                                all_items.extend(items)
+                        except Exception as e:
+                            if self.verbose:
+                                print(f"Error enumerating region {region}: {str(e)}")
+                
+                if not all_items:
+                    raise ValueError("No items found in any region")
+                    
+                return sorted(list(set(all_items)))  # Remove duplicates and sort
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error in region-based enumeration: {str(e)}")
+                # Fall through to basic enumeration
+        
+        # For other cases, use basic enumeration
+        prompt = f"""Convert this search space description into a complete list of specific items to search.
+Do not use ellipsis (...) - list ALL items. Return ONLY a valid JSON array.
+
+For example:
+Query: "all US States"
+["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"]
+
+Query: "all CA counties"
+["Alameda", "Alpine", "Amador", "Butte", "Calaveras", "Colusa", "Contra Costa", "Del Norte", "El Dorado", "Fresno", "Glenn", "Humboldt", "Imperial", "Inyo", "Kern", "Kings", "Lake", "Lassen", "Los Angeles", "Madera", "Marin", "Mariposa", "Mendocino", "Merced", "Modoc", "Mono", "Monterey", "Napa", "Nevada", "Orange", "Placer", "Plumas", "Riverside", "Sacramento", "San Benito", "San Bernardino", "San Diego", "San Francisco", "San Joaquin", "San Luis Obispo", "San Mateo", "Santa Barbara", "Santa Clara", "Santa Cruz", "Shasta", "Sierra", "Siskiyou", "Solano", "Sonoma", "Stanislaus", "Sutter", "Tehama", "Trinity", "Tulare", "Tuolumne", "Ventura", "Yolo", "Yuba"]
+
+Query: "all years between 2001 and 2005"
+["2001", "2002", "2003", "2004", "2005"]
+
+Query: "all US state governors"
+Return a complete JSON array of ALL US state governors. Do not use ellipsis.
+
+Query: "top 5 tech companies"
+["Apple", "Microsoft", "Google", "Amazon", "Meta"]
+
+Query: "{search_space}"
+"""
+        try:
+            result = await self._generate_and_parse_json(prompt)
+            if not result or not isinstance(result, list):
+                raise ValueError("Expected JSON array of items")
             
-            return EntityResult(**data)
-        except json.JSONDecodeError as e:
+            return result
+            
+        except Exception as e:
             if self.verbose:
-                print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {text}")
-            return None
+                print(f"Error enumerating search space: {str(e)}")
+            raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
+    
+    def _build_extraction_prompt(self, text: str, entity_type: str, attributes: List[str]) -> str:
+        """Build a prompt for extracting information from text."""
+        attrs_str = "\n".join([f"- {attr}" for attr in attributes])
+        return f"""Extract information about the {entity_type} from the following text. Return a JSON object with these fields:
+{attrs_str}
+
+If you cannot find the required information, return an empty JSON object {{}}.
+Do not make up or guess any information.
+
+Text to analyze:
+{text}
+
+Return ONLY the JSON object, no other text:"""
+    
+    async def parse_search_result(self, text: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, Any]]:
+        """Parse search result text into structured data based on requested attributes."""
+        try:
+            prompt = self._build_extraction_prompt(text, entity_type, attributes)
+            result = await self._generate_and_parse_json(prompt)
+            return result if result else None
         except Exception as e:
             if self.verbose:
                 print(f"Error parsing search result: {str(e)}")
@@ -260,45 +299,45 @@ class GeminiClient:
         if attribute == "address":
             prompt += """
         Return a valid JSON object with this field:
-        {
-          "address": {
+        {{
+          "address": {{
             "street_address": "Full street number and name (e.g., '123 Main St')",
             "city": "City name only (e.g., 'Los Angeles')",
             "state": "State abbreviation (e.g., 'CA')",
             "zip_code": "5-digit ZIP code (e.g., '90210')"
-          }
-        }
+          }}
+        }}
         
         Note: Include any address components you find, even if incomplete. For example:
-        {
-          "address": {
+        {{
+          "address": {{
             "city": "San Francisco",
             "state": "CA"
-          }
-        }
+          }}
+        }}
         """
         elif attribute == "contact":
             prompt += """
         Return a valid JSON object with this field:
-        {
-          "contact": {
+        {{
+          "contact": {{
             "phone": "Full phone number with area code",
             "email": "Complete email address"
-          }
-        }
+          }}
+        }}
         
         Note: Include either phone or email if found, doesn't need both:
-        {
-          "contact": {
+        {{
+          "contact": {{
             "phone": "(555) 123-4567"
-          }
-        }
+          }}
+        }}
         """
         elif attribute == "hours":
             prompt += """
         Return a valid JSON object with this field:
-        {
-          "hours": {
+        {{
+          "hours": {{
             "monday": "Hours in format '9:00 AM - 5:00 PM'",
             "tuesday": "Hours in format '9:00 AM - 5:00 PM'",
             "wednesday": "Hours in format '9:00 AM - 5:00 PM'",
@@ -306,16 +345,16 @@ class GeminiClient:
             "friday": "Hours in format '9:00 AM - 5:00 PM'",
             "saturday": "Hours in format '9:00 AM - 5:00 PM'",
             "sunday": "Hours in format '9:00 AM - 5:00 PM'"
-          }
-        }
+          }}
+        }}
         
         Note: Include any days you find hours for, omit others:
-        {
-          "hours": {
+        {{
+          "hours": {{
             "monday": "6:00 AM - 10:00 PM",
             "saturday": "8:00 AM - 8:00 PM"
-          }
-        }
+          }}
+        }}
         """
         else:
             prompt += f"""
@@ -351,48 +390,3 @@ class GeminiClient:
             if self.verbose:
                 print(f"Error extracting {attribute}: {str(e)}")
             return None
-    
-    async def enumerate_search_space(self, search_space: str) -> List[str]:
-        """Convert a search space description into a list of specific items."""
-        prompt = f"""
-        Break down this description into a list of specific items:
-        "{search_space}"
-        
-        Return a JSON array containing each individual item.
-        The items should be as specific and atomic as possible.
-        Do not include extra text or formatting - just the essential identifier for each item.
-        
-        Examples:
-        "all California zip codes" → ["90001", "94102", "92101", ...]
-        "all US States" → ["CA", "AZ", "OR", ...]
-        "all years between 2001 and 2005" → ["2001", "2002", "2003", "2004", "2005"]
-        "all US state governors" → ["Kay Ivey", "Mike Dunleavy", "Katie Hobbs", ...]
-        "top 5 tech companies" → ["Apple", "Microsoft", "Google", "Amazon", "Meta"]
-        "primary colors" → ["red", "blue", "yellow"]
-        
-        Important:
-        1. Return ONLY the JSON array
-        2. Keep items as concise as possible (e.g., "CA" not "California")
-        3. Limit to 20-30 items for large sets to keep the search efficient
-        4. For ranges (years, numbers), include all items in the range
-        5. For finite sets (colors, states), include all items
-        """
-        
-        try:
-            text = await self._generate_with_retry(prompt)
-            text = self._clean_json_text(text)
-            
-            items = json.loads(text)
-            if not isinstance(items, list):
-                raise ValueError("Expected JSON array of items")
-            
-            return items
-        except json.JSONDecodeError as e:
-            if self.verbose:
-                print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {text}")
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
-        except Exception as e:
-            if self.verbose:
-                print(f"Error enumerating search space: {str(e)}")
-            raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")

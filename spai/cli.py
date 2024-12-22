@@ -3,23 +3,28 @@
 import asyncio
 import json
 import os
+import signal
+import sys
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import polars as pl
 import rich
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID, TaskProgressColumn
 from rich.table import Table
 
 from .gemini_client import GeminiClient
-from .models import SearchQuery, EntityResult
+from .models import EntityResult
 from .search_client import GoogleSearchClient
 
 # Load environment variables
 load_dotenv()
 
+console = Console()
 app = typer.Typer(
     name="spai",
     help="""
@@ -41,13 +46,73 @@ app = typer.Typer(
         $ spai search "Show me restaurants in San Francisco" --format json
     
     Note: Always wrap your query in quotes when it contains spaces:
-        ✓ spai search "athletic center in arizona"
-        ✗ spai search athletic center in arizona
+        $ spai search "athletic center in arizona"
     """,
     no_args_is_help=True,
 )
 
-console = Console()
+# Global variables for graceful shutdown
+_current_results = []
+_global_output_format = "csv"
+_global_output_file = "results.csv"
+should_shutdown = False
+
+def signal_handler(signum, frame):
+    """Handle Ctrl-C by setting shutdown flag and writing current results."""
+    global should_shutdown
+    if not should_shutdown:  # Only handle first Ctrl-C
+        console.print("\n[yellow]Received interrupt signal. Writing current results and shutting down...[/yellow]")
+        should_shutdown = True
+        # Write current results
+        if _current_results:
+            write_results(_current_results, fmt=_global_output_format, file=_global_output_file)
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
+def flatten_dict(d: dict, parent_key: str = '', sep: str = '_') -> dict:
+    """Flatten nested dictionaries for CSV output."""
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        elif v is not None:  # Only include non-None values
+            items.append((new_key, v))
+    return dict(items)
+
+def write_results(results: List[Dict[str, Any]], fmt: str = "csv", file: Optional[str] = None) -> None:
+    """Write results to file or stdout."""
+    if not results:
+        return
+    
+    if fmt == "json":
+        output = json.dumps(results, indent=2)
+        if file:
+            Path(file).write_text(output)
+        else:
+            console.print_json(output)
+    else:  # csv
+        # Flatten nested dictionaries and remove empty values
+        flat_results = []
+        for result in results:
+            if result:  # Skip empty results
+                flat_dict = flatten_dict(result)
+                if flat_dict:  # Only include non-empty results
+                    flat_results.append(flat_dict)
+        
+        if flat_results:
+            # Create DataFrame with all available columns
+            df = pl.DataFrame(flat_results)
+            
+            if file:
+                df.write_csv(file)
+            else:
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp:
+                    df.write_csv(tmp.name)
+                    tmp.seek(0)
+                    print(tmp.read())
+                os.unlink(tmp.name)
 
 def version_callback(value: bool):
     if value:
@@ -79,22 +144,22 @@ def search(
         metavar="QUERY",
     ),
     max_results: int = typer.Option(
-        10,
+        10,  # Reset to 10
         "--max-results", "-n",
-        help="Maximum number of search results to process",
+        help="Maximum number of search results to process per item",
         min=1,
         max=50,
     ),
     output_format: str = typer.Option(
-        "table",
+        "csv",  # Changed default
         "--format", "-f",
         help="Output format: table, json, or csv",
         case_sensitive=False,
     ),
     output_file: Optional[str] = typer.Option(
-        None,
+        "results.csv",  # Default output file
         "--output", "-o",
-        help="Output file path. If not specified, output is written to stdout.",
+        help="Output file path. If not specified, writes to results.csv for CSV format.",
     ),
     temperature: float = typer.Option(
         0.1,
@@ -143,232 +208,149 @@ async def async_main(
     verbose: bool,
 ) -> None:
     """Main async function to handle the search and extraction process."""
+    global _current_results, _global_output_format, _global_output_file
+    
+    # Store output settings for signal handler
+    _global_output_format = output_format
+    _global_output_file = output_file or "results.csv"
     
     if verbose:
         console.print("[yellow]Initializing clients...[/yellow]")
     
-    # Initialize clients
-    gemini_client = GeminiClient(temperature=temperature, verbose=verbose)
-    search_client = GoogleSearchClient(max_results=max_results)
+    gemini = GeminiClient(verbose=verbose, temperature=temperature)
+    search = GoogleSearchClient(max_results=max_results)
     
     # Parse the query
     if verbose:
         console.print("[yellow]Parsing query...[/yellow]")
-    query_struct: SearchQuery = await gemini_client.parse_query(query)
-    
-    if verbose:
-        console.print(f"[green]Parsed query:[/green]")
-        console.print(f"- Entities: {query_struct.entities}")
-        console.print(f"- Attributes: {query_struct.entity_attributes}")
-        console.print(f"- Search Space: {query_struct.search_space}")
-    
-    # Enumerate search space into specific items
-    if verbose:
-        console.print("[yellow]Enumerating search space...[/yellow]")
     try:
-        items = await gemini_client.enumerate_search_space(query_struct.search_space)
+        entity_type, attributes, search_space = await gemini.parse_query(query)
         if verbose:
-            console.print(f"[green]Found {len(items)} items to search[/green]")
+            console.print(f"Entity Type: {entity_type}")
+            console.print(f"Attributes: {attributes}")
+            console.print(f"Search Space: {search_space}")
     except Exception as e:
-        if verbose:
-            console.print(f"[yellow]Failed to enumerate search space: {str(e)}[/yellow]")
-            console.print("[yellow]Falling back to direct search...[/yellow]")
-        items = [query_struct.search_space]
-    
-    # Get search results for each item
-    if verbose:
-        console.print("[yellow]Searching...[/yellow]")
-    
-    all_search_results = []
-    seen_titles = set()  # Track unique results
-    
-    total_items = len(items)
-    with console.status("[bold green]Searching across items...") as status:
-        for idx, item in enumerate(items, 1):
-            status.update(f"[bold green]Searching item {idx}/{total_items}: {item}")
-            if verbose:
-                console.print(f"\n[blue]Searching: {query_struct.entities} ({item})[/blue]")
-            
-            # Create a new search client for each item to respect max_results
-            item_search_client = GoogleSearchClient(max_results=max_results)
-            
-            # Construct search query based on the type of item
-            if item.isdigit() or (item.startswith('-') and item[1:].isdigit()):
-                # For years or numbers, don't use "in"
-                search_query = f"{query_struct.entities} {item}"
-            elif len(item) == 2 and item.isalpha():
-                # For state codes, use "in"
-                search_query = f"{query_struct.entities} in {item}"
-            elif any(c.isdigit() for c in item) and any(c.isalpha() for c in item):
-                # For ZIP codes or mixed alphanumeric, use near
-                search_query = f"{query_struct.entities} near {item}"
-            else:
-                # For names or other items, try both with and without "in"
-                search_query = f"{query_struct.entities} {item}"
-                alt_query = f"{query_struct.entities} in {item}"
-                
-                # Try both queries
-                results = await item_search_client.search(search_query)
-                alt_results = await item_search_client.search(alt_query)
-                
-                # Combine and deduplicate results
-                seen_in_this_batch = set()
-                combined_results = []
-                
-                for r in results + alt_results:
-                    if r["title"] not in seen_in_this_batch:
-                        seen_in_this_batch.add(r["title"])
-                        combined_results.append(r)
-                
-                # Only add unique results
-                for result in combined_results:
-                    if result["title"] not in seen_titles:
-                        seen_titles.add(result["title"])
-                        all_search_results.append(result)
-                
-                if verbose:
-                    console.print(f"  [green]Found {len(combined_results)} results[/green]")
-                continue  # Skip the regular search below
-            
-            # Regular search for other cases
-            search_results = await item_search_client.search(search_query)
-            
-            # Only add unique results
-            item_results = []
-            for result in search_results:
-                if result["title"] not in seen_titles:
-                    seen_titles.add(result["title"])
-                    all_search_results.append(result)
-                    item_results.append(result)
-            
-            if verbose:
-                console.print(f"  [green]Found {len(item_results)} results[/green]")
-    
-    if not all_search_results:
-        console.print("[red]No search results found[/red]")
+        console.print(f"[red]Error parsing query: {str(e)}[/red]")
         return
     
-    # Process each result
-    if verbose:
-        console.print("\n[yellow]Processing search results...[/yellow]")
+    # Get search terms
+    try:
+        search_terms = await gemini.enumerate_search_space(search_space)
+    except Exception as e:
+        console.print(f"[red]Error enumerating search space: {str(e)}[/red]")
+        return
     
-    results = []
-    total_results = len(all_search_results)
-    with console.status("[bold green]Extracting data...") as status:
-        for idx, result in enumerate(all_search_results, 1):
-            status.update(f"[bold green]Processing result {idx}/{total_results}")
+    # Create progress bars
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+        expand=True,
+        transient=False  # Keep the progress bar visible
+    )
+    
+    status_console = Console()  # Separate console for status updates
+    
+    all_search_results = []
+    
+    with progress:
+        # First task: searching
+        search_task = progress.add_task(
+            description="[cyan]Searching...",
+            total=len(search_terms)
+        )
+        
+        # Search for each term
+        for term in search_terms:
+            if should_shutdown:
+                break
+                
+            search_query = f"{entity_type} in {term}"
+            progress.update(search_task, description=f"[cyan]Searching: {term}")
+            
             if verbose:
-                console.print(f"[blue]Processing: {result['title']}[/blue]")
+                # Use print instead of console.print to avoid interfering with progress bar
+                print(f"\033[34mSearching: {search_query}\033[0m")
             
             try:
-                # First pass: Extract data from search snippet
-                extracted = await gemini_client.parse_search_result(
-                    result["snippet"],
-                    query_struct.entity_attributes
-                )
-                
-                if extracted is None:
-                    if verbose:
-                        console.print("[yellow]No data extracted from result[/yellow]")
-                    continue
-                
-                # Second pass: For each missing requested attribute, do a targeted search
-                if extracted.name:  # Only do second pass if we have a name
-                    for attr in query_struct.entity_attributes:
-                        # Check if the attribute is missing or empty
-                        has_attr = False
-                        if attr == "address":
-                            has_attr = extracted.address is not None
-                        elif attr == "contact":
-                            has_attr = extracted.contact is not None
-                        elif attr == "hours":
-                            has_attr = extracted.hours is not None
-                        else:
-                            has_attr = getattr(extracted, attr, None) is not None
-                        
-                        if not has_attr:
-                            if verbose:
-                                console.print(f"  [yellow]Searching for {attr}...[/yellow]")
-                            
-                            # Do a targeted search for this attribute
-                            attr_search_client = GoogleSearchClient(max_results=3)  # New client with lower max_results
-                            attr_results = await attr_search_client.search(
-                                f"{extracted.name} {attr}"
-                            )
-                            
-                            # Combine all snippets for better context
-                            combined_text = "\n".join(r["snippet"] for r in attr_results)
-                            
-                            # Extract the attribute
-                            attr_data = await gemini_client.extract_attribute(
-                                extracted.name,
-                                attr,
-                                combined_text
-                            )
-                            
-                            # Update the extracted result with the new data if found
-                            if attr_data is not None and attr in attr_data:
-                                setattr(extracted, attr, attr_data[attr])
-                                if verbose:
-                                    console.print(f"  [green]Found {attr} information[/green]")
-                
-                results.append(extracted.to_flat_dict(set(query_struct.entity_attributes)))
+                results = await search.search(search_query)
+                all_search_results.extend(results)
             except Exception as e:
                 if verbose:
-                    console.print(f"[red]Failed to process result: {str(e)}[/red]")
+                    print(f"\033[31mError searching for {term}: {str(e)}\033[0m")
+            
+            progress.update(search_task, advance=1)
+            
+            # Update global results in case of interrupt
+            _current_results = all_search_results
     
-    # Convert results to DataFrame
+    if not all_search_results:
+        status_console.print("[red]No search results found[/red]")
+        return
+    
+    if verbose:
+        status_console.print(f"[green]Found {len(all_search_results)} total results[/green]")
+    
+    # Process results with Gemini
+    results = []
+    
+    # Single progress bar for all processing
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+        expand=True,
+        transient=False
+    ) as process_progress:
+        process_task = process_progress.add_task(
+            description="[cyan]Processing results...",
+            total=len(all_search_results)
+        )
+        
+        for idx, result in enumerate(all_search_results, 1):
+            if should_shutdown:
+                break
+            
+            title = result.get('title', 'Untitled')[:40]
+            process_progress.update(
+                process_task,
+                description=f"[cyan]Processing {idx}/{len(all_search_results)}: {title}..."
+            )
+            
+            if verbose:
+                print(f"\033[34mProcessing: {title}\033[0m")
+            
+            try:
+                # Extract snippet or full text
+                text = result.get("snippet", "") or result.get("text", "")
+                if not text:
+                    continue
+                
+                # Parse with Gemini
+                extracted = await gemini.parse_search_result(text, entity_type, attributes)
+                if not extracted:
+                    if verbose:
+                        print("\033[33mNo data extracted from result\033[0m")
+                    continue
+                
+                results.append(extracted)
+                
+                # Update global results in case of interrupt
+                _current_results = results
+            except Exception as e:
+                if verbose:
+                    print(f"\033[31mError processing result: {str(e)}\033[0m")
+            
+            process_progress.update(process_task, advance=1)
+    
+    # Write results
     if results:
-        df = pl.DataFrame(results)
-        
-        # Preview results in table format (limited to 20 rows)
-        if len(df) > 0:
-            table = Table(show_header=True, header_style="bold magenta")
-            
-            # Add columns
-            for col in df.columns:
-                table.add_column(col)
-            
-            # Add rows (limited to 20)
-            for row in df.head(20).rows():
-                table.add_row(*[str(cell) for cell in row])
-            
-            console.print("\n[bold]Preview of results:[/bold]")
-            console.print(table)
-            
-            if len(df) > 20:
-                console.print(f"\n[dim]... and {len(df) - 20} more rows[/dim]")
-        
-        # Write output in requested format
-        output_format = output_format.lower()
-        if output_file:
-            # Create output directory if it doesn't exist
-            output_path = Path(output_file)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            if output_format == "json":
-                with open(output_file, "w") as f:
-                    json.dump(df.to_dict(as_series=False), f, indent=2)
-            elif output_format == "csv":
-                df.write_csv(output_file)
-            else:
-                console.print(f"[red]Unsupported output format for file: {output_format}[/red]")
-                return
-            
-            console.print(f"[green]Results written to: {output_file}[/green]")
-        else:
-            if output_format == "json":
-                console.print_json(df.to_dict(as_series=False))
-            elif output_format == "csv":
-                # For CSV without a file, write to a temporary file and read it back
-                temp_file = "temp_output.csv"
-                df.write_csv(temp_file)
-                with open(temp_file, "r") as f:
-                    console.print(f.read())
-                os.remove(temp_file)
-            # Table format is already shown in preview
-    else:
-        console.print("[red]No structured data could be extracted[/red]")
+        write_results(results, fmt=output_format, file=output_file)
+        status_console.print(f"[green]Wrote {len(results)} results[/green]")
 
 # Expose the Typer app as main for the Poetry script
 main = app

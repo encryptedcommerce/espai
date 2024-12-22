@@ -6,6 +6,8 @@ from typing import List, Optional
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from .rate_limiter import RateLimiter, with_exponential_backoff
+
 
 class GoogleSearchClient:
     """Client for performing Google searches."""
@@ -27,6 +29,22 @@ class GoogleSearchClient:
             
         self.max_results = max_results
         self.service = build("customsearch", "v1", developerKey=self.api_key)
+        self.rate_limiter = RateLimiter(min_delay=1.0)  # 1 request per second
+    
+    async def _execute_search(self, query: str, start_index: int) -> dict:
+        """Execute a single search request with retries."""
+        await self.rate_limiter.wait()
+        
+        return await with_exponential_backoff(
+            self.service.cse().list(
+                q=query,
+                cx=self.cse_id,
+                start=start_index
+            ).execute,
+            max_retries=6,
+            base_delay=2.0,
+            max_delay=64.0
+        )
     
     async def search(self, query: str) -> List[dict]:
         """Perform a Google search and return results."""
@@ -35,11 +53,7 @@ class GoogleSearchClient:
             start_index = 1
             
             while len(results) < self.max_results:
-                response = self.service.cse().list(
-                    q=query,
-                    cx=self.cse_id,
-                    start=start_index
-                ).execute()
+                response = await self._execute_search(query, start_index)
                 
                 if "items" not in response:
                     break
