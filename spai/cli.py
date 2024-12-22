@@ -20,6 +20,7 @@ from rich.table import Table
 from .gemini_client import GeminiClient
 from .models import EntityResult
 from .search_client import GoogleSearchClient
+from .scraper import Scraper  # Import Scraper class
 
 # Load environment variables
 load_dotenv()
@@ -222,6 +223,7 @@ async def async_main(
     try:
         gemini = GeminiClient(verbose=verbose, temperature=temperature)
         search = GoogleSearchClient(max_results=max_results)
+        scraper = Scraper()  # Initialize Scraper
         
         # Parse the query
         if verbose:
@@ -396,35 +398,55 @@ async def async_main(
                             
                             # Extract attributes from each search result until we find one
                             for attr_result in attr_results:
-                                try:
-                                    # Build full text from search result
-                                    text_parts = []
-                                    if attr_result.get("title"):
-                                        text_parts.append(attr_result["title"])
-                                    if attr_result.get("snippet"):
-                                        text_parts.append(attr_result["snippet"])
-                                    if attr_result.get("displayLink"):
-                                        text_parts.append(attr_result["displayLink"])
+                                if should_shutdown:
+                                    break
                                     
-                                    text = "\n".join(text_parts)
-                                    
+                                # Build full text from search result
+                                text_parts = []
+                                if attr_result.get("title"):
+                                    text_parts.append(attr_result["title"])
+                                if attr_result.get("snippet"):
+                                    text_parts.append(attr_result["snippet"])
+                                if attr_result.get("displayLink"):
+                                    text_parts.append(attr_result["displayLink"])
+                                
+                                text = "\n".join(text_parts)
+                                
+                                if verbose:
+                                    print(f"\033[34mExtracting from text:\n{text}\033[0m\n")
+                                
+                                extracted = await gemini.parse_search_result(
+                                    text,
+                                    entity_type,
+                                    [attr]
+                                )
+                                if extracted and attr in extracted:
+                                    result[attr] = extracted[attr]
+                                    # Update global results in case of interrupt
+                                    _current_results = results
+                                    break  # Found the attribute, move to next one
+                                
+                                # If we didn't find the attribute in the snippet, try scraping the page
+                                if attr_result.get("link") and not (extracted and attr in extracted):
                                     if verbose:
-                                        print(f"\033[34mExtracting from text:\n{text}\033[0m\n")
+                                        print(f"\033[34mTrying to scrape page: {attr_result['link']}\033[0m")
                                     
-                                    extracted = await gemini.parse_search_result(
-                                        text,
-                                        entity_type,
-                                        [attr]
-                                    )
-                                    if extracted and attr in extracted:
-                                        result[attr] = extracted[attr]
-                                        # Update global results in case of interrupt
-                                        _current_results = results
-                                        break  # Found the attribute, move to next one
-                                except Exception as e:
-                                    if verbose:
-                                        print(f"\033[31mError extracting {attr}: {str(e)}\033[0m\n")
-                                    continue
+                                    page_text = await scraper.scrape_page(attr_result["link"])
+                                    if page_text:
+                                        if verbose:
+                                            print(f"\033[34mExtracted text from page:\n{page_text[:500]}...\033[0m\n")
+                                        
+                                        extracted = await gemini.parse_search_result(
+                                            page_text,
+                                            entity_type,
+                                            [attr]
+                                        )
+                                        if extracted and attr in extracted:
+                                            result[attr] = extracted[attr]
+                                            # Update global results in case of interrupt
+                                            _current_results = results
+                                            break  # Found the attribute, move to next one
+                                            
                         except Exception as e:
                             if verbose:
                                 print(f"\033[31mError searching for {attr}: {str(e)}\033[0m\n")
