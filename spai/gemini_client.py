@@ -1,13 +1,10 @@
 """Gemini AI client for query parsing and result extraction."""
 
-import asyncio
 import json
 import os
 from typing import Dict, List, Optional
 
-import vertexai
-from google.cloud import aiplatform
-from vertexai.language_models import TextGenerationModel
+import google.generativeai as genai
 
 from .models import SearchQuery
 
@@ -15,16 +12,43 @@ from .models import SearchQuery
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    def __init__(self, api_key: Optional[str] = None):
-        """Initialize the Gemini client."""
+    MODEL_NAME = "gemini-2.0-flash-exp"
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        temperature: float = 0.1,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        max_output_tokens: int = 1024,
+    ):
+        """Initialize the Gemini client.
+        
+        Args:
+            api_key: Gemini API key
+            temperature: Controls randomness in the output (0.0 to 1.0)
+            top_k: Number of highest probability tokens to consider
+            top_p: Cumulative probability cutoff for token selection
+            max_output_tokens: Maximum number of tokens to generate
+        """
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Gemini API key not provided")
         
-        # Initialize Vertex AI with credentials
-        vertexai.init(project="your-project-id")
-        self.model = TextGenerationModel.from_pretrained("gemini-2.0-flash-exp")
+        # Configure the Gemini API
+        genai.configure(api_key=self.api_key)
         
+        # Set up the model with generation config
+        self.model = genai.GenerativeModel(
+            model_name=self.MODEL_NAME,
+            generation_config=genai.types.GenerationConfig(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+            )
+        )
+    
     async def parse_query(self, query: str) -> SearchQuery:
         """Parse a natural language query into structured components."""
         prompt = f"""
@@ -65,8 +89,8 @@ class GeminiClient:
         """
         
         try:
-            response = await self._generate_text(prompt)
-            data = json.loads(response)
+            response = await self.model.aio.generate_content(prompt)
+            data = json.loads(response.text)
             return SearchQuery(**data)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
@@ -74,15 +98,7 @@ class GeminiClient:
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
     async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Dict:
-        """Parse search result text into structured data based on requested attributes.
-        
-        Args:
-            text: The text to parse
-            entity_attributes: List of attributes to extract from the text
-        
-        Returns:
-            Dictionary containing the extracted attributes
-        """
+        """Parse search result text into structured data based on requested attributes."""
         # Create a dynamic instruction for each attribute
         attribute_instructions = []
         for attr in entity_attributes:
@@ -130,8 +146,8 @@ class GeminiClient:
         """
         
         try:
-            response = await self._generate_text(prompt)
-            return json.loads(response)
+            response = await self.model.aio.generate_content(prompt)
+            return json.loads(response.text)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
         except Exception as e:
@@ -152,28 +168,9 @@ class GeminiClient:
         """
         
         try:
-            response = await self._generate_text(prompt)
-            return json.loads(response)
+            response = await self.model.aio.generate_content(prompt)
+            return json.loads(response.text)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
         except Exception as e:
             raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
-    
-    async def _generate_text(self, prompt: str) -> str:
-        """Generate text using Gemini model with async support."""
-        loop = asyncio.get_event_loop()
-        try:
-            # Run the synchronous Gemini call in a thread pool
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.model.predict(
-                    prompt,
-                    temperature=0.1,  # Low temperature for more deterministic responses
-                    max_output_tokens=1024,
-                    top_k=1,
-                    top_p=0.8,
-                ).text
-            )
-            return response.strip()
-        except Exception as e:
-            raise RuntimeError(f"Error generating text with Gemini: {str(e)}")
