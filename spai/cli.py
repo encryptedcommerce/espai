@@ -184,10 +184,57 @@ async def async_main(
                 console.print(f"[blue]Processing: {result['title']}[/blue]")
             
             try:
+                # First pass: Extract data from search snippet
                 extracted = await gemini_client.parse_search_result(
                     result["snippet"],
                     query_struct.entity_attributes
                 )
+                
+                if extracted is None:
+                    if verbose:
+                        console.print("[yellow]No data extracted from result[/yellow]")
+                    continue
+                
+                # Second pass: For each missing requested attribute, do a targeted search
+                if extracted.name:  # Only do second pass if we have a name
+                    for attr in query_struct.entity_attributes:
+                        # Check if the attribute is missing or empty
+                        has_attr = False
+                        if attr == "address":
+                            has_attr = extracted.address is not None
+                        elif attr == "contact":
+                            has_attr = extracted.contact is not None
+                        elif attr == "hours":
+                            has_attr = extracted.hours is not None
+                        else:
+                            has_attr = getattr(extracted, attr, None) is not None
+                        
+                        if not has_attr:
+                            if verbose:
+                                console.print(f"  [yellow]Searching for {attr}...[/yellow]")
+                            
+                            # Do a targeted search for this attribute
+                            attr_search_client = GoogleSearchClient(max_results=3)  # New client with lower max_results
+                            attr_results = await attr_search_client.search(
+                                f"{extracted.name} {attr}"
+                            )
+                            
+                            # Combine all snippets for better context
+                            combined_text = "\n".join(r["snippet"] for r in attr_results)
+                            
+                            # Extract the attribute
+                            attr_data = await gemini_client.extract_attribute(
+                                extracted.name,
+                                attr,
+                                combined_text
+                            )
+                            
+                            # Update the extracted result with the new data if found
+                            if attr_data is not None and attr in attr_data:
+                                setattr(extracted, attr, attr_data[attr])
+                                if verbose:
+                                    console.print(f"  [green]Found {attr} information[/green]")
+                
                 results.append(extracted.to_flat_dict(set(query_struct.entity_attributes)))
             except Exception as e:
                 if verbose:

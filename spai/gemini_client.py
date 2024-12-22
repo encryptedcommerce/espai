@@ -1,10 +1,12 @@
 """Gemini AI client for query parsing and result extraction."""
 
+import asyncio
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import google.generativeai as genai
+from google.api_core import retry
 
 from .models import SearchQuery, EntityResult, Address, Contact, Hours
 
@@ -46,6 +48,34 @@ class GeminiClient:
             generation_config=generation_config
         )
     
+    async def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
+        """Generate content with retry logic for rate limiting."""
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                response = await self.model.generate_content_async(prompt)
+                if self.verbose:
+                    print(f"Raw response text: {response.text}")
+                return response.text
+            except Exception as e:
+                if "429" in str(e) and retry_count < max_retries - 1:
+                    retry_count += 1
+                    wait_time = 2 ** retry_count  # Exponential backoff
+                    if self.verbose:
+                        print(f"Rate limited, waiting {wait_time}s before retry {retry_count + 1}/{max_retries}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+    
+    def _clean_json_text(self, text: str) -> str:
+        """Clean text to ensure it's valid JSON."""
+        text = text.strip()
+        if text.startswith('```json'):
+            text = text[7:]
+        if text.endswith('```'):
+            text = text[:-3]
+        return text.strip()
+    
     async def parse_query(self, query: str) -> SearchQuery:
         """Parse a natural language query into structured components."""
         prompt = f"""
@@ -86,101 +116,108 @@ class GeminiClient:
         """
         
         try:
-            response = await self.model.generate_content_async(prompt)
-            if self.verbose:
-                print(f"Raw response text: {response.text}")
-            
-            # Clean the response text to ensure it's valid JSON
-            text = response.text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.endswith('```'):
-                text = text[:-3]
-            text = text.strip()
+            text = await self._generate_with_retry(prompt)
+            text = self._clean_json_text(text)
             
             data = json.loads(text)
             return SearchQuery(**data)
         except json.JSONDecodeError as e:
             if self.verbose:
                 print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {response.text}")
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
+                print(f"Response text: {text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
         except Exception as e:
             if self.verbose:
                 print(f"Error parsing query: {str(e)}")
-                print(f"Response text: {response.text}")
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
-    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> EntityResult:
+    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Optional[EntityResult]:
         """Parse search result text into structured data based on requested attributes."""
         prompt = f"""
-        Extract structured information from the following text:
-        {text}
+        You are an expert at extracting structured information from text.
         
-        Return a valid JSON object with these fields where available:
-        - name: Entity name or title
+        Extract relevant information from this text:
+        ---
+        {text}
+        ---
+        
+        Look carefully for:
+        1. The name of the entity
+        2. Any other requested attributes
+        
+        Return a valid JSON object with these fields:
+        - name: The official or primary name of the entity
         """
         
         # Add specific field instructions based on requested attributes
         if "address" in entity_attributes:
             prompt += """
-        - address:
-            street_address: Full street address
-            city: City name
-            state: State name
-            zip_code: ZIP or postal code"""
+        - address: {
+            street_address: The street number and name (e.g., "123 Main St"),
+            city: City name only (e.g., "Los Angeles"),
+            state: State abbreviation (e.g., "CA"),
+            zip_code: 5-digit ZIP code (e.g., "90210")
+          }
+          Note: Include any address components you find, even if incomplete."""
         
         if "contact" in entity_attributes:
             prompt += """
-        - contact:
-            phone: Phone number
-            email: Email address"""
+        - contact: {
+            phone: Full phone number with area code,
+            email: Complete email address
+          }"""
         
         if "hours" in entity_attributes:
             prompt += """
-        - hours:
-            monday: Operating hours for Monday
-            tuesday: Operating hours for Tuesday
-            wednesday: Operating hours for Wednesday
-            thursday: Operating hours for Thursday
-            friday: Operating hours for Friday
-            saturday: Operating hours for Saturday
-            sunday: Operating hours for Sunday"""
+        - hours: {
+            monday: Hours in format "9:00 AM - 5:00 PM",
+            tuesday: Hours in format "9:00 AM - 5:00 PM",
+            wednesday: Hours in format "9:00 AM - 5:00 PM",
+            thursday: Hours in format "9:00 AM - 5:00 PM",
+            friday: Hours in format "9:00 AM - 5:00 PM",
+            saturday: Hours in format "9:00 AM - 5:00 PM",
+            sunday: Hours in format "9:00 AM - 5:00 PM"
+          }"""
         
         if "rating" in entity_attributes:
-            prompt += "\n        - rating: Rating information (e.g., '4.5 stars')"
+            prompt += "\n        - rating: Rating out of 5 stars (e.g., '4.5 stars' or '4.5/5')"
         
         if "website" in entity_attributes:
-            prompt += "\n        - website: Website URL"
+            prompt += "\n        - website: Complete URL starting with http:// or https://"
         
         if "price" in entity_attributes:
-            prompt += "\n        - price: Price range or cost information"
+            prompt += "\n        - price: Price range (e.g., '$', '$$', '$$$') or specific costs"
         
         if "description" in entity_attributes:
-            prompt += "\n        - description: General description or details"
+            prompt += "\n        - description: Brief description of the entity and its offerings"
         
         prompt += """
         
-        Ensure the response is ONLY the JSON object, with no additional text.
-        If a field is not found in the text, omit it from the JSON rather than including null or empty values.
-        Format addresses consistently, e.g., '123 Main St, City, State 12345'
+        Important:
+        1. Return ONLY a valid JSON object
+        2. Include ONLY fields where you found information
+        3. If you can't find a name or any relevant information, return an empty object {}
+        4. For addresses, include any components you find, even if the address is incomplete
+        5. Don't make up or guess at any information - only include what's explicitly in the text
+        
+        Example good response for partial information:
+        {
+          "name": "LA Fitness Downtown",
+          "address": {
+            "city": "Los Angeles",
+            "state": "CA"
+          }
+        }
         """
         
         try:
-            response = await self.model.generate_content_async(prompt)
-            if self.verbose:
-                print(f"Raw response text: {response.text}")
-            
-            # Clean the response text to ensure it's valid JSON
-            text = response.text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.endswith('```'):
-                text = text[:-3]
-            text = text.strip()
+            text = await self._generate_with_retry(prompt)
+            text = self._clean_json_text(text)
             
             data = json.loads(text)
-            
+            if not data or "name" not in data:  # Must at least have a name
+                return None
+                
             # Convert nested dictionaries to proper models
             if "address" in data and isinstance(data["address"], dict):
                 data["address"] = Address(**data["address"])
@@ -193,13 +230,127 @@ class GeminiClient:
         except json.JSONDecodeError as e:
             if self.verbose:
                 print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {response.text}")
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
+                print(f"Response text: {text}")
+            return None
         except Exception as e:
             if self.verbose:
                 print(f"Error parsing search result: {str(e)}")
-                print(f"Response text: {response.text}")
-            raise RuntimeError(f"Error parsing search result with Gemini: {str(e)}")
+            return None
+    
+    async def extract_attribute(self, entity_name: str, attribute: str, text: str) -> Optional[dict]:
+        """Extract a specific attribute from text about an entity."""
+        prompt = f"""
+        You are an expert at extracting specific information from text.
+        
+        Find the {attribute} information for this entity:
+        Name: "{entity_name}"
+        
+        Search this text:
+        ---
+        {text}
+        ---
+        
+        Important:
+        1. Only extract information that clearly refers to {entity_name}
+        2. Do not extract information about other entities
+        3. Do not make up or guess at information
+        4. Return an empty object {{}} if you cannot find relevant information
+        """
+        
+        if attribute == "address":
+            prompt += """
+        Return a valid JSON object with this field:
+        {
+          "address": {
+            "street_address": "Full street number and name (e.g., '123 Main St')",
+            "city": "City name only (e.g., 'Los Angeles')",
+            "state": "State abbreviation (e.g., 'CA')",
+            "zip_code": "5-digit ZIP code (e.g., '90210')"
+          }
+        }
+        
+        Note: Include any address components you find, even if incomplete. For example:
+        {
+          "address": {
+            "city": "San Francisco",
+            "state": "CA"
+          }
+        }
+        """
+        elif attribute == "contact":
+            prompt += """
+        Return a valid JSON object with this field:
+        {
+          "contact": {
+            "phone": "Full phone number with area code",
+            "email": "Complete email address"
+          }
+        }
+        
+        Note: Include either phone or email if found, doesn't need both:
+        {
+          "contact": {
+            "phone": "(555) 123-4567"
+          }
+        }
+        """
+        elif attribute == "hours":
+            prompt += """
+        Return a valid JSON object with this field:
+        {
+          "hours": {
+            "monday": "Hours in format '9:00 AM - 5:00 PM'",
+            "tuesday": "Hours in format '9:00 AM - 5:00 PM'",
+            "wednesday": "Hours in format '9:00 AM - 5:00 PM'",
+            "thursday": "Hours in format '9:00 AM - 5:00 PM'",
+            "friday": "Hours in format '9:00 AM - 5:00 PM'",
+            "saturday": "Hours in format '9:00 AM - 5:00 PM'",
+            "sunday": "Hours in format '9:00 AM - 5:00 PM'"
+          }
+        }
+        
+        Note: Include any days you find hours for, omit others:
+        {
+          "hours": {
+            "monday": "6:00 AM - 10:00 PM",
+            "saturday": "8:00 AM - 8:00 PM"
+          }
+        }
+        """
+        else:
+            prompt += f"""
+        Return a valid JSON object with this field:
+        {{
+          "{attribute}": "The {attribute} information that specifically refers to {entity_name}"
+        }}
+        """
+        
+        try:
+            text = await self._generate_with_retry(prompt)
+            text = self._clean_json_text(text)
+            
+            data = json.loads(text)
+            if not data:  # Empty object
+                return None
+            
+            # Convert nested dictionaries to proper models if needed
+            if attribute == "address" and "address" in data and isinstance(data["address"], dict):
+                data["address"] = Address(**data["address"])
+            elif attribute == "contact" and "contact" in data and isinstance(data["contact"], dict):
+                data["contact"] = Contact(**data["contact"])
+            elif attribute == "hours" and "hours" in data and isinstance(data["hours"], dict):
+                data["hours"] = Hours(**data["hours"])
+            
+            return data
+        except json.JSONDecodeError as e:
+            if self.verbose:
+                print(f"JSON decode error at position {e.pos}")
+                print(f"Response text: {text}")
+            return None
+        except Exception as e:
+            if self.verbose:
+                print(f"Error extracting {attribute}: {str(e)}")
+            return None
     
     async def enumerate_search_space(self, search_space: str) -> List[str]:
         """Convert a search space description into a list of specific items."""
@@ -216,26 +367,16 @@ class GeminiClient:
         """
         
         try:
-            response = await self.model.generate_content_async(prompt)
-            if self.verbose:
-                print(f"Raw response text: {response.text}")
-            
-            # Clean the response text to ensure it's valid JSON
-            text = response.text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.endswith('```'):
-                text = text[:-3]
-            text = text.strip()
+            text = await self._generate_with_retry(prompt)
+            text = self._clean_json_text(text)
             
             return json.loads(text)
         except json.JSONDecodeError as e:
             if self.verbose:
                 print(f"JSON decode error at position {e.pos}")
-                print(f"Response text: {response.text}")
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
+                print(f"Response text: {text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
         except Exception as e:
             if self.verbose:
                 print(f"Error enumerating search space: {str(e)}")
-                print(f"Response text: {response.text}")
             raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
