@@ -133,7 +133,7 @@ async def async_main(
         console.print("[yellow]Initializing clients...[/yellow]")
     
     # Initialize clients
-    gemini_client = GeminiClient(temperature=temperature)
+    gemini_client = GeminiClient(temperature=temperature, verbose=verbose)
     search_client = GoogleSearchClient(max_results=max_results)
     
     # Parse the query

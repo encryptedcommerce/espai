@@ -12,7 +12,7 @@ from .models import SearchQuery
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    MODEL_NAME = "gemini-2.0-flash-exp"
+    MODEL_NAME = "gemini-pro"  # Using the correct model name
     
     def __init__(
         self,
@@ -21,19 +21,14 @@ class GeminiClient:
         top_k: int = 1,
         top_p: float = 0.8,
         max_output_tokens: int = 1024,
+        verbose: bool = False,
     ):
-        """Initialize the Gemini client.
-        
-        Args:
-            api_key: Gemini API key
-            temperature: Controls randomness in the output (0.0 to 1.0)
-            top_k: Number of highest probability tokens to consider
-            top_p: Cumulative probability cutoff for token selection
-            max_output_tokens: Maximum number of tokens to generate
-        """
+        """Initialize the Gemini client."""
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Gemini API key not provided")
+        
+        self.verbose = verbose
         
         # Configure the Gemini API
         genai.configure(api_key=self.api_key)
@@ -92,11 +87,28 @@ class GeminiClient:
         
         try:
             response = await self.model.generate_content_async(prompt)
-            data = json.loads(response.text)
+            if self.verbose:
+                print(f"Raw response text: {response.text}")
+            
+            # Clean the response text to ensure it's valid JSON
+            text = response.text.strip()
+            if text.startswith('```json'):
+                text = text[7:]  # Remove ```json prefix
+            if text.endswith('```'):
+                text = text[:-3]  # Remove ``` suffix
+            text = text.strip()
+            
+            data = json.loads(text)
             return SearchQuery(**data)
         except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
+            if self.verbose:
+                print(f"JSON decode error at position {e.pos}")
+                print(f"Response text: {response.text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
         except Exception as e:
+            if self.verbose:
+                print(f"Error parsing query: {str(e)}")
+                print(f"Response text: {response.text}")
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
     async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Dict:
@@ -149,10 +161,27 @@ class GeminiClient:
         
         try:
             response = await self.model.generate_content_async(prompt)
-            return json.loads(response.text)
+            if self.verbose:
+                print(f"Raw response text: {response.text}")
+            
+            # Clean the response text to ensure it's valid JSON
+            text = response.text.strip()
+            if text.startswith('```json'):
+                text = text[7:]  # Remove ```json prefix
+            if text.endswith('```'):
+                text = text[:-3]  # Remove ``` suffix
+            text = text.strip()
+            
+            return json.loads(text)
         except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
+            if self.verbose:
+                print(f"JSON decode error at position {e.pos}")
+                print(f"Response text: {response.text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
         except Exception as e:
+            if self.verbose:
+                print(f"Error parsing search result: {str(e)}")
+                print(f"Response text: {response.text}")
             raise RuntimeError(f"Error parsing search result with Gemini: {str(e)}")
     
     async def enumerate_search_space(self, search_space: str) -> List[str]:
@@ -171,8 +200,25 @@ class GeminiClient:
         
         try:
             response = await self.model.generate_content_async(prompt)
-            return json.loads(response.text)
+            if self.verbose:
+                print(f"Raw response text: {response.text}")
+            
+            # Clean the response text to ensure it's valid JSON
+            text = response.text.strip()
+            if text.startswith('```json'):
+                text = text[7:]  # Remove ```json prefix
+            if text.endswith('```'):
+                text = text[:-3]  # Remove ``` suffix
+            text = text.strip()
+            
+            return json.loads(text)
         except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse Gemini response as JSON: {str(e)}")
+            if self.verbose:
+                print(f"JSON decode error at position {e.pos}")
+                print(f"Response text: {response.text}")
+            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {response.text}")
         except Exception as e:
+            if self.verbose:
+                print(f"Error enumerating search space: {str(e)}")
+                print(f"Response text: {response.text}")
             raise RuntimeError(f"Error enumerating search space with Gemini: {str(e)}")
