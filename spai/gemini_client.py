@@ -194,7 +194,7 @@ class GeminiClient:
         prompt += """
         
         Important:
-        1. Return ONLY a valid JSON object
+        1. Return ONLY the JSON object
         2. Include ONLY fields where you found information
         3. If you can't find a name or any relevant information, return an empty object {}
         4. For addresses, include any components you find, even if the address is incomplete
@@ -355,22 +355,38 @@ class GeminiClient:
     async def enumerate_search_space(self, search_space: str) -> List[str]:
         """Convert a search space description into a list of specific items."""
         prompt = f"""
-        Generate a list of specific items for this search space:
+        Break down this description into a list of specific items:
         "{search_space}"
         
-        Return a valid JSON array of strings representing each item in the search space.
-        For example, if the search space is "all California zip codes", return an array of ZIP codes.
-        If the search space is "top 10 US cities by population", return those city names.
+        Return a JSON array containing each individual item.
+        The items should be as specific and atomic as possible.
+        Do not include extra text or formatting - just the essential identifier for each item.
         
-        Ensure the response is ONLY the JSON array, with no additional text.
-        Limit the response to a maximum of 50 items to keep the search manageable.
+        Examples:
+        "all California zip codes" → ["90001", "94102", "92101", ...]
+        "all US States" → ["CA", "AZ", "OR", ...]
+        "all years between 2001 and 2005" → ["2001", "2002", "2003", "2004", "2005"]
+        "all US state governors" → ["Kay Ivey", "Mike Dunleavy", "Katie Hobbs", ...]
+        "top 5 tech companies" → ["Apple", "Microsoft", "Google", "Amazon", "Meta"]
+        "primary colors" → ["red", "blue", "yellow"]
+        
+        Important:
+        1. Return ONLY the JSON array
+        2. Keep items as concise as possible (e.g., "CA" not "California")
+        3. Limit to 20-30 items for large sets to keep the search efficient
+        4. For ranges (years, numbers), include all items in the range
+        5. For finite sets (colors, states), include all items
         """
         
         try:
             text = await self._generate_with_retry(prompt)
             text = self._clean_json_text(text)
             
-            return json.loads(text)
+            items = json.loads(text)
+            if not isinstance(items, list):
+                raise ValueError("Expected JSON array of items")
+            
+            return items
         except json.JSONDecodeError as e:
             if self.verbose:
                 print(f"JSON decode error at position {e.pos}")

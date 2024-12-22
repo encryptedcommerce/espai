@@ -162,24 +162,101 @@ async def async_main(
         console.print(f"- Attributes: {query_struct.entity_attributes}")
         console.print(f"- Search Space: {query_struct.search_space}")
     
-    # Get search results
+    # Enumerate search space into specific items
+    if verbose:
+        console.print("[yellow]Enumerating search space...[/yellow]")
+    try:
+        items = await gemini_client.enumerate_search_space(query_struct.search_space)
+        if verbose:
+            console.print(f"[green]Found {len(items)} items to search[/green]")
+    except Exception as e:
+        if verbose:
+            console.print(f"[yellow]Failed to enumerate search space: {str(e)}[/yellow]")
+            console.print("[yellow]Falling back to direct search...[/yellow]")
+        items = [query_struct.search_space]
+    
+    # Get search results for each item
     if verbose:
         console.print("[yellow]Searching...[/yellow]")
-    search_results = await search_client.search(
-        f"{query_struct.entities} in {query_struct.search_space}"
-    )
     
-    if not search_results:
+    all_search_results = []
+    seen_titles = set()  # Track unique results
+    
+    total_items = len(items)
+    with console.status("[bold green]Searching across items...") as status:
+        for idx, item in enumerate(items, 1):
+            status.update(f"[bold green]Searching item {idx}/{total_items}: {item}")
+            if verbose:
+                console.print(f"\n[blue]Searching: {query_struct.entities} ({item})[/blue]")
+            
+            # Create a new search client for each item to respect max_results
+            item_search_client = GoogleSearchClient(max_results=max_results)
+            
+            # Construct search query based on the type of item
+            if item.isdigit() or (item.startswith('-') and item[1:].isdigit()):
+                # For years or numbers, don't use "in"
+                search_query = f"{query_struct.entities} {item}"
+            elif len(item) == 2 and item.isalpha():
+                # For state codes, use "in"
+                search_query = f"{query_struct.entities} in {item}"
+            elif any(c.isdigit() for c in item) and any(c.isalpha() for c in item):
+                # For ZIP codes or mixed alphanumeric, use near
+                search_query = f"{query_struct.entities} near {item}"
+            else:
+                # For names or other items, try both with and without "in"
+                search_query = f"{query_struct.entities} {item}"
+                alt_query = f"{query_struct.entities} in {item}"
+                
+                # Try both queries
+                results = await item_search_client.search(search_query)
+                alt_results = await item_search_client.search(alt_query)
+                
+                # Combine and deduplicate results
+                seen_in_this_batch = set()
+                combined_results = []
+                
+                for r in results + alt_results:
+                    if r["title"] not in seen_in_this_batch:
+                        seen_in_this_batch.add(r["title"])
+                        combined_results.append(r)
+                
+                # Only add unique results
+                for result in combined_results:
+                    if result["title"] not in seen_titles:
+                        seen_titles.add(result["title"])
+                        all_search_results.append(result)
+                
+                if verbose:
+                    console.print(f"  [green]Found {len(combined_results)} results[/green]")
+                continue  # Skip the regular search below
+            
+            # Regular search for other cases
+            search_results = await item_search_client.search(search_query)
+            
+            # Only add unique results
+            item_results = []
+            for result in search_results:
+                if result["title"] not in seen_titles:
+                    seen_titles.add(result["title"])
+                    all_search_results.append(result)
+                    item_results.append(result)
+            
+            if verbose:
+                console.print(f"  [green]Found {len(item_results)} results[/green]")
+    
+    if not all_search_results:
         console.print("[red]No search results found[/red]")
         return
     
     # Process each result
     if verbose:
-        console.print("[yellow]Processing search results...[/yellow]")
+        console.print("\n[yellow]Processing search results...[/yellow]")
     
     results = []
+    total_results = len(all_search_results)
     with console.status("[bold green]Extracting data...") as status:
-        for result in search_results:
+        for idx, result in enumerate(all_search_results, 1):
+            status.update(f"[bold green]Processing result {idx}/{total_results}")
             if verbose:
                 console.print(f"[blue]Processing: {result['title']}[/blue]")
             
