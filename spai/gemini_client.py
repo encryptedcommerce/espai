@@ -32,15 +32,33 @@ class GeminiClient:
         Query: "{query}"
         
         Return a valid JSON object with these fields:
-        - entities: The main target entities to search for
-        - entity_attributes: List of attributes to extract
-        - search_space: The space to search within
+        - entities: The main target entities to search for (e.g., "athletic centers", "restaurants")
+        - entity_attributes: List of attributes to extract. Common attributes include:
+          * name (entity name)
+          * address (full address with street, city, state, zip)
+          * contact (phone, email)
+          * hours (business hours)
+          * rating (customer ratings)
+          * website (website URL)
+          * price (price range or costs)
+          * description (general description)
+          Extract ANY attributes that are explicitly mentioned or strongly implied by the query.
+        - search_space: The space to search within (e.g., "all California zip codes", "top 10 US cities")
         
-        Example format:
+        Example 1:
+        Query: "Find gyms with good ratings and contact info in New York"
         {{
-            "entities": "athletic centers",
-            "entity_attributes": ["name", "address"],
-            "search_space": "all California zip codes"
+            "entities": "gyms",
+            "entity_attributes": ["name", "rating", "contact", "address"],
+            "search_space": "New York"
+        }}
+        
+        Example 2:
+        Query: "List coffee shops and their business hours in Seattle"
+        {{
+            "entities": "coffee shops",
+            "entity_attributes": ["name", "hours", "address"],
+            "search_space": "Seattle"
         }}
         
         Ensure the response is ONLY the JSON object, with no additional text.
@@ -55,22 +73,57 @@ class GeminiClient:
         except Exception as e:
             raise RuntimeError(f"Error parsing query with Gemini: {str(e)}")
     
-    async def parse_search_result(self, text: str) -> Dict:
-        """Parse search result text into structured data."""
+    async def parse_search_result(self, text: str, entity_attributes: List[str]) -> Dict:
+        """Parse search result text into structured data based on requested attributes.
+        
+        Args:
+            text: The text to parse
+            entity_attributes: List of attributes to extract from the text
+        
+        Returns:
+            Dictionary containing the extracted attributes
+        """
+        # Create a dynamic instruction for each attribute
+        attribute_instructions = []
+        for attr in entity_attributes:
+            if attr == "address":
+                attribute_instructions.append(
+                    '- address: {\n'
+                    '    street_address: Full street address\n'
+                    '    city: City name\n'
+                    '    state: State name\n'
+                    '    zip_code: ZIP or postal code\n'
+                    '  }'
+                )
+            elif attr == "contact":
+                attribute_instructions.append(
+                    '- contact: {\n'
+                    '    phone: Phone number\n'
+                    '    email: Email address\n'
+                    '  }'
+                )
+            elif attr == "hours":
+                attribute_instructions.append(
+                    '- hours: {\n'
+                    '    monday: Operating hours for Monday\n'
+                    '    tuesday: Operating hours for Tuesday\n'
+                    '    wednesday: Operating hours for Wednesday\n'
+                    '    thursday: Operating hours for Thursday\n'
+                    '    friday: Operating hours for Friday\n'
+                    '    saturday: Operating hours for Saturday\n'
+                    '    sunday: Operating hours for Sunday\n'
+                    '  }'
+                )
+            else:
+                # For simple attributes, just add them directly
+                attribute_instructions.append(f'- {attr}: Relevant {attr} information from the text')
+        
         prompt = f"""
         Extract structured information from the following text:
         {text}
         
         Return a valid JSON object with these fields where available:
-        - name: Name of the entity
-        - address: {{
-            street_address: Street address
-            city: City name
-            state: State name
-            zip_code: ZIP code
-          }}
-        - website_url: Website URL if present
-        - additional_details: Any other relevant information
+        {chr(10).join(attribute_instructions)}
         
         Ensure the response is ONLY the JSON object, with no additional text.
         If a field is not found in the text, omit it from the JSON rather than including null or empty values.

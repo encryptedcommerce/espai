@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import polars as pl
 import typer
@@ -37,6 +37,7 @@ def signal_handler(signum, frame):
 async def process_search_space_item(
     item: str,
     entities: str,
+    entity_attributes: List[str],
     search_client: GoogleSearchClient,
     gemini_client: GeminiClient,
 ) -> list[EntityResult]:
@@ -49,17 +50,18 @@ async def process_search_space_item(
         if should_exit:
             break
             
-        parsed = await gemini_client.parse_search_result(result.get("snippet", ""))
-        processed_results.append(
-            EntityResult(
-                entity_id=result["link"],
-                name=parsed["name"],
-                address=parsed.get("address"),
-                website_url=result["link"],
-                additional_details=parsed.get("additional_details", {}),
-                search_space_item=item
-            )
+        parsed = await gemini_client.parse_search_result(
+            result.get("snippet", ""),
+            entity_attributes
         )
+        
+        # Create EntityResult with dynamic attributes
+        entity_result = EntityResult(
+            entity_id=result["link"],
+            search_space_item=item,
+            **parsed  # All parsed attributes are added dynamically
+        )
+        processed_results.append(entity_result)
     
     return processed_results
 
@@ -86,6 +88,7 @@ def main(
         # Parse the query
         with console.status("[bold green]Parsing query..."):
             parsed_query = loop.run_until_complete(gemini_client.parse_query(query))
+            console.print(f"[blue]Detected attributes to extract: {', '.join(parsed_query.entity_attributes)}[/blue]")
         
         # Enumerate search space
         with console.status("[bold green]Enumerating search space..."):
@@ -113,6 +116,7 @@ def main(
                     process_search_space_item(
                         item,
                         parsed_query.entities,
+                        parsed_query.entity_attributes,  # Use attributes from parsed query
                         search_client,
                         gemini_client
                     )
