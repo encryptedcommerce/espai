@@ -283,7 +283,12 @@ async def async_main(
             if output_format == "json":
                 console.print_json(df.to_dict(as_series=False))
             elif output_format == "csv":
-                console.print(df.write_csv())
+                # For CSV without a file, write to a temporary file and read it back
+                temp_file = "temp_output.csv"
+                df.write_csv(temp_file)
+                with open(temp_file, "r") as f:
+                    console.print(f.read())
+                os.remove(temp_file)
             # Table format is already shown in preview
     else:
         console.print("[red]No structured data could be extracted[/red]")
