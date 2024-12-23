@@ -1,10 +1,10 @@
 [tool.poetry]
-name = "spai"
+name = "espai"
 version = "0.1.0"
-description = "Search, Parse, and Iterate - A tool for structured data extraction from search results"
+description = "Enumerate, Search, Parse, and Iterate - A tool for structured data extraction from search results"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
-packages = [{include = "spai"}]
+packages = [{include = "espai"}]
 
 [tool.poetry.dependencies]
 python = "^3.9"
@@ -30,4 +30,4 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
-spai = "spai.cli:main"
+espai = "espai.cli:main"

@@ -1,4 +1,4 @@
-# spai (Search, Parse, and Iterate)
+# espai (Enumerate, Search, Parse, and Iterate)
 
 A powerful tool for structured data extraction from search results using Google Search and Gemini AI.
 
@@ -15,19 +15,19 @@ A powerful tool for structured data extraction from search results using Google 
 ## Installation
 
 ```bash
-pip install spai
+pip install espai
 ```
 
 ## Usage
 
 Basic usage:
 ```bash
-spai "Athletic center names and addresses in all California zip codes"
+espai "Athletic center names and addresses in all California zip codes"
 ```
 
 With options:
 ```bash
-spai "Athletic center names and addresses in all California zip codes" \
+espai "Athletic center names and addresses in all California zip codes" \
   --max-results=10 \
   --output-format=csv
 ```
