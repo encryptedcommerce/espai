@@ -30,7 +30,7 @@ class GeminiClient:
         genai.configure(api_key=api_key)
         
         self.model = genai.GenerativeModel(
-            model_name="gemini-pro",
+            model_name="gemini-2.0-flash-exp",
             generation_config=genai.types.GenerationConfig(
                 temperature=temperature
             )
@@ -53,7 +53,7 @@ class GeminiClient:
             return result
         except Exception as e:
             if self.verbose:
-                print(f"\n[Error] Generation failed: {str(e)}")
+                print(f"\033[38;5;209mError generating response: {str(e)}\033[0m\n")  # Light orange color
             raise
     
     async def _generate_and_parse_json(self, prompt: str) -> Optional[Dict]:
@@ -68,37 +68,65 @@ class GeminiClient:
         try:
             response = await self._generate_with_retry(prompt)
             
-            if self.verbose:
-                # Handle multi-part responses
-                if hasattr(response, 'parts'):
-                    text = '\n'.join(part.text for part in response.parts)
-                else:
-                    text = response.text
-                print(f"\033[34mGemini Response:\n{text}\033[0m\n")
-            
-            # Extract text from response
+            # Handle multi-part responses
             if hasattr(response, 'parts'):
                 text = '\n'.join(part.text for part in response.parts)
             else:
                 text = response.text
                 
+            if self.verbose:
+                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
+            
             # Try to find JSON in the response
             try:
-                # First try to parse the entire response as JSON
-                return json.loads(text)
-            except json.JSONDecodeError:
-                # If that fails, try to find JSON-like content
+                # First check for code blocks
+                code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+                if code_block_match:
+                    try:
+                        return json.loads(code_block_match.group(1))
+                    except:
+                        pass
+                
+                # Then try to parse the entire text
+                try:
+                    return json.loads(text.strip())
+                except:
+                    pass
+                
+                # Finally try to find JSON-like content
+                text = text.strip()
+                if text.startswith('['):
+                    # Find matching closing bracket
+                    count = 0
+                    for i, char in enumerate(text):
+                        if char == '[':
+                            count += 1
+                        elif char == ']':
+                            count -= 1
+                            if count == 0:
+                                try:
+                                    return json.loads(text[:i+1])
+                                except:
+                                    pass
+                                break
+                
+                # Try to find object matches
                 matches = re.findall(r'\{[^}]+\}', text)
                 if matches:
                     return json.loads(matches[0])
-                else:
-                    if self.verbose:
-                        print(f"\033[31mNo JSON found in response\033[0m\n")
-                    return None
+                
+                if self.verbose:
+                    print(f"\033[38;5;209mNo JSON found in response\033[0m\n")  # Light orange color
+                return None
                     
+            except Exception as e:
+                if self.verbose:
+                    print(f"\033[38;5;209mError parsing JSON: {str(e)}\033[0m\n")  # Light orange color
+                return None
+            
         except Exception as e:
             if self.verbose:
-                print(f"\033[31mError generating response: {str(e)}\033[0m\n")
+                print(f"\033[38;5;209mError generating response: {str(e)}\033[0m\n")  # Light orange color
             return None
             
     async def parse_query(
@@ -148,7 +176,7 @@ search_space: none"""
                 text = response.text
                 
             if self.verbose:
-                print(f"\033[34mGemini Response:\n{text}\033[0m\n")
+                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
             
             # Parse response
             lines = text.strip().split('\n')
@@ -195,7 +223,7 @@ search_space: none"""
             
         except Exception as e:
             if self.verbose:
-                print(f"\033[31mError parsing query: {str(e)}\033[0m\n")
+                print(f"\033[38;5;209mError parsing query: {str(e)}\033[0m\n")  # Light orange color
             raise
     
     async def enumerate_search_space(self, search_space: str) -> List[str]:
@@ -223,6 +251,98 @@ For example, for "New England states" return:
         
         return await self._generate_and_parse_json(prompt)
     
+    async def extract_attributes(self, text: str, url: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, str]]:
+        """Extract requested attributes from text.
+        
+        Args:
+            text: Text to extract from
+            url: URL the text came from
+            entity_type: Type of entity to extract
+            attributes: List of attributes to extract
+            
+        Returns:
+            Dictionary of extracted attributes or None if failed
+        """
+        prompt = f"""Extract information about this {entity_type} from the following text:
+
+Text: {text}
+URL: {url}
+
+Extract these attributes:
+{', '.join(attributes)}
+
+Rules:
+1. Only include attributes that are explicitly mentioned in the text
+2. Do not guess or infer values
+3. For addresses, include as much detail as given (street, city, state, zip)
+4. Return values exactly as they appear in text
+5. Omit attributes if no value is found
+
+Return as JSON with the attribute names as keys.
+Example:
+{{
+    "name": "LA Fitness",
+    "address": "123 Main St, Tampa, FL 33601"
+}}"""
+
+        try:
+            response = await self._generate_with_retry(prompt)
+            
+            if hasattr(response, 'parts'):
+                text = '\n'.join(part.text for part in response.parts)
+            else:
+                text = response.text
+                
+            if self.verbose:
+                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
+            
+            # Try to find JSON in the response
+            try:
+                # First check for code blocks
+                code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+                if code_block_match:
+                    try:
+                        return json.loads(code_block_match.group(1))
+                    except:
+                        pass
+                
+                # Then try to parse the entire text
+                try:
+                    return json.loads(text.strip())
+                except:
+                    pass
+                
+                # Finally try to find JSON-like content
+                text = text.strip()
+                if text.startswith('{'):
+                    # Find matching closing brace
+                    count = 0
+                    for i, char in enumerate(text):
+                        if char == '{':
+                            count += 1
+                        elif char == '}':
+                            count -= 1
+                            if count == 0:
+                                try:
+                                    return json.loads(text[:i+1])
+                                except:
+                                    pass
+                                break
+                
+                if self.verbose:
+                    print(f"\033[38;5;209mNo JSON found in response\033[0m\n")  # Light orange color
+                return None
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"\033[38;5;209mError parsing JSON: {str(e)}\033[0m\n")  # Light orange color
+                return None
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")  # Light orange color
+            return None
+    
     async def parse_search_result(
         self,
         text: str,
@@ -239,42 +359,4 @@ For example, for "New England states" return:
         Returns:
             Dictionary of extracted attributes or None if no match
         """
-        prompt = f"""Extract information about a {entity_type} from this text:
-
-{text}
-
-Rules:
-1. If the text contains a {entity_type}, extract these attributes: {', '.join(attributes)}
-2. If you can't find a {entity_type}, return "none"
-3. If a URL is provided, use it to help identify the entity name
-4. The name should be the official/formal name of the {entity_type}
-5. Remove any extra text like "Home", "Welcome to", "Official Site of" from names
-6. If you're not confident about the extraction, return "none"
-
-Example 1:
-Text: "Welcome to Example Corp - Home Page | Leading Tech Solutions"
-URL: example-corp.com
-Output: {{"name": "Example Corp"}}
-
-Example 2:
-Text: "Front Page"
-URL: adrenalinesportsacademy.com
-Output: {{"name": "Adrenaline Sports Academy"}}
-
-Example 3:
-Text: "Page not found"
-URL: example.com/404
-Output: none
-
-Format the output as a JSON object with the extracted attributes as keys.
-If no {entity_type} is found, output "none"."""
-
-        try:
-            result = await self._generate_and_parse_json(prompt)
-            if not result or not isinstance(result, dict):
-                return None
-            return result if any(result.values()) else None
-        except (ValueError, AttributeError):
-            if self.verbose:
-                print(f"\nFailed to parse result from text: {text[:100]}...")
-            return None
+        return await self.extract_attributes(text, "", entity_type, attributes)

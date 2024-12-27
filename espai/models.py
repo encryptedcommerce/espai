@@ -1,7 +1,7 @@
 """Data models for espai."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict
 
 
 @dataclass
@@ -16,16 +16,17 @@ class SearchResult:
 
 @dataclass
 class EntityResult:
-    """Extracted entity data."""
+    """A result entity with its attributes."""
     name: str
-    search_space: str
-    street_address: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    zip_code: Optional[str] = None
+    search_space: Optional[str] = None
     website: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
+    address: Optional[str] = None
+    street_address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip: Optional[str] = None
     
     @classmethod
     def from_dict(cls, data: dict, search_space: str) -> "EntityResult":
@@ -65,14 +66,39 @@ class EntityResult:
         return cls(
             name=name,
             search_space=search_space,
+            website=data.get("website"),
+            phone=data.get("phone"),
+            email=data.get("email"),
+            address=address,
             street_address=street,
             city=city,
             state=state,
-            zip_code=zip_code,
-            website=data.get("website"),
-            phone=data.get("phone"),
-            email=data.get("email")
+            zip=zip_code
         )
+    
+    def to_dict(self) -> Dict[str, Optional[str]]:
+        """Convert to dictionary with all attributes."""
+        return {
+            'name': self.name,
+            'search_space': self.search_space or "unknown",
+            'website': self.website or "unknown",
+            'phone': self.phone or "unknown",
+            'email': self.email or "unknown",
+            'address': self.address or "unknown",
+            'street_address': self.street_address or "unknown",
+            'city': self.city or "unknown",
+            'state': self.state or "unknown",
+            'zip': self.zip or "unknown"
+        }
+        
+    def get_attribute(self, attr: str) -> Optional[str]:
+        """Get an attribute value safely."""
+        return getattr(self, attr, None) or "unknown"
+        
+    def set_attribute(self, attr: str, value: Optional[str]) -> None:
+        """Set an attribute value safely."""
+        if hasattr(self, attr):
+            setattr(self, attr, value if value and value.lower() != "unknown" else None)
     
     def __eq__(self, other: object) -> bool:
         """Compare two EntityResults for equality."""
