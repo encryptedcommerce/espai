@@ -201,22 +201,6 @@ async def search(
         if should_shutdown:
             return
             
-        # Get search space items
-        search_items = []
-        if search_space:
-            if verbose:
-                console.print("[yellow]Enumerating search space...[/yellow]")
-                
-            search_items = await gemini.enumerate_search_space(search_space)
-            if verbose:
-                console.print("Enumerated search space:")
-                console.print(search_items)
-        else:
-            search_items = [""]  # Single empty item if no search space
-            
-        if should_shutdown:
-            return
-            
         # Create progress bars
         progress = Progress(
             SpinnerColumn(),
@@ -236,14 +220,33 @@ async def search(
         # Create empty DataFrame with specified schema
         results_df = pl.DataFrame(schema={col: pl.Utf8 for col in columns})
         
-        # First pass - get entities
+        # Enumerate search space if needed
+        enumerated_space = None
+        if search_space:
+            try:
+                enumerated_space = await gemini.enumerate_search_space(search_space)
+                if verbose and enumerated_space:
+                    print("\nEnumerated search space:")
+                    for item in enumerated_space:
+                        print(f"- {item}")
+                    print()
+            except Exception as e:
+                if verbose:
+                    print(f"\033[38;5;209mError enumerating search space: {str(e)}\033[0m\n")
+        
+        # First pass - get entities from search space
         with progress:
             first_pass = progress.add_task(
                 "[cyan]Finding entities...",
-                total=len(search_items)
+                total=len(enumerated_space) if enumerated_space else 1
             )
             
-            for space_item in search_items:
+            # Track found entities to avoid duplicates
+            found_entities = set()
+            
+            # Search within each enumerated item or the general search space
+            search_spaces_to_try = enumerated_space if enumerated_space else [search_space]
+            for space_item in search_spaces_to_try:
                 if should_shutdown:
                     break
                     
@@ -266,261 +269,187 @@ async def search(
                             break
                             
                         try:
-                            # Include URL in text for better context
-                            text_parts = []
-                            if result.title:
-                                text_parts.append(result.title)
-                            if result.snippet:
-                                text_parts.append(result.snippet)
-                            if result.url:  # Add URL for better context
-                                text_parts.append(f"URL: {result.url}")
-                            
-                            text = "\n".join(text_parts)
-                            
-                            extracted = await gemini.parse_search_result(
-                                text,
+                            if verbose:
+                                print(f"\033[38;5;33mExtracting from text:\n{result.title}\n{result.snippet}\n{result.url}\033[0m\n")
+                                
+                            extracted = await gemini.extract_attributes(
+                                f"{result.title}\n{result.snippet}",
+                                result.url,
                                 entity_type,
-                                ["name"]
+                                ["name"]  # Only look for name in first pass
                             )
                             
                             if extracted and "name" in extracted:
-                                new_result = EntityResult.from_dict(extracted, space_item)
-                                if new_result:
-                                    results.append(new_result)
-                                    # Update global results in case of interrupt
-                                    _current_results = results
+                                entity_name = extracted["name"]
+                                if entity_name not in found_entities:
+                                    found_entities.add(entity_name)
                                     
-                                    # Convert to DataFrame row with all columns
+                                    # Initialize row with name and search space
                                     row_data = {col: None for col in columns}
                                     row_data.update({
-                                        "name": result.name,
-                                        "search_space": result.search_space or "unknown"
+                                        "name": entity_name,
+                                        "search_space": space_item  # Use the enumerated item instead of original search space
                                     })
                                     
-                                    # Add any available attributes
-                                    for attr in attributes:
-                                        if attr == 'address':
-                                            # Handle address components
-                                            row_data.update({
-                                                "address": result.get_attribute("address"),
-                                                "street_address": result.get_attribute("street_address"),
-                                                "city": result.get_attribute("city"),
-                                                "state": result.get_attribute("state"),
-                                                "zip": result.get_attribute("zip")
-                                            })
-                                        else:
-                                            row_data[attr] = result.get_attribute(attr)
+                                    # Add to DataFrame
+                                    new_row = pl.DataFrame([row_data])
+                                    results_df = pl.concat([results_df, new_row], how="vertical")
                                     
-                                    # Create new row with exact column order
-                                    new_row = pl.DataFrame([{col: row_data.get(col, "unknown") for col in columns}])
-                                    
-                                    try:
-                                        results_df = pl.concat([results_df, new_row], how="vertical")
-                                        if verbose:
-                                            print(f"Added row: {row_data}")
-                                    except Exception as e:
-                                        if verbose:
-                                            print(f"\033[31mError adding row: {str(e)}\nRow data: {row_data}\nColumns: {columns}\033[0m\n")
-                                        continue
+                                    if verbose:
+                                        print(f"\nFound {entity_type}: {entity_name}")
+                                        for attr in attributes:
+                                            if attr == 'address' and row_data.get('address'):
+                                                print(f"  Address: {row_data['address']}")
+                                                # Only show address components that exist
+                                                if row_data.get('street_address'):
+                                                    print(f"    Street: {row_data.get('street_address')}")
+                                                if row_data.get('city'):
+                                                    print(f"    City: {row_data.get('city')}")
+                                                if row_data.get('state'):
+                                                    print(f"    State: {row_data.get('state')}")
+                                                if row_data.get('zip'):
+                                                    print(f"    ZIP: {row_data.get('zip')}")
+                                            elif row_data.get(attr):
+                                                print(f"  {attr.title()}: {row_data.get(attr)}")
                                         
+                                # Stop if we found all entities
+                                if len(found_entities) == max_results:
+                                    break
+                                    
                         except Exception as e:
+                            if verbose:
+                                print(f"\033[38;5;209mError extracting entity: {str(e)}\033[0m\n")
                             continue
                             
                 except Exception as e:
                     if verbose:
-                        print(f"\033[31mError searching for entities: {str(e)}\033[0m\n")
+                        print(f"\033[38;5;209mError searching for entities: {str(e)}\033[0m\n")
                     continue
                     
                 progress.update(first_pass, advance=1)
-        
+                
         if should_shutdown:
             return
             
-        # Second pass - get attributes
+        # Second pass - get attributes for each entity
         with progress:
             second_pass = progress.add_task(
                 "[cyan]Getting attributes...",
-                total=len(results)
+                total=len(results_df)
             )
             
-            for result in results:
+            # Process each found entity
+            for i in range(len(results_df)):
                 if should_shutdown:
                     break
                     
-                try:
-                    # Initialize tracking of found attributes
-                    found_attributes = set()
-                    
-                    # Get remaining attributes
-                    remaining_attrs = [
-                        attr for attr in attributes
-                        if attr != "name" and not getattr(result, attr, None)
-                    ]
-                    
-                    if not remaining_attrs:
-                        continue
+                row = results_df.row(i, named=True)
+                entity_name = row['name']
+                
+                # Get the specific enumerated item for this row
+                space_item = None
+                if enumerated_space and len(enumerated_space) > 0:
+                    space_item = enumerated_space[i % len(enumerated_space)]
+                else:
+                    space_item = search_space
                         
+                try:
                     # Build attribute search query
-                    attr_query = f"{result.name} {' '.join(remaining_attrs)}"
-                    if result.search_space:
-                        attr_query += f" in {result.search_space}"
+                    attr_query = f"{entity_name} {' '.join(attributes)}"
+                    if space_item:
+                        attr_query += f" in {space_item}"
                         
                     if verbose:
-                        print(f"\033[34mSearching for attributes: {attr_query}\033[0m")
+                        print(f"\033[38;5;12mSearching for attributes: {attr_query}\033[0m")
                         
-                    # Search for attributes using Google
-                    attr_results = await google_search.search(
+                    # Search for attributes
+                    attr_results = await search.search(
                         attr_query,
                         max_results=max_results
                     )
                     
-                    # Extract attributes from each result
-                    for attr_result in attr_results:
+                    # Track which attributes we've found
+                    found_attributes = set()
+                    
+                    # Extract attributes from results
+                    for result in attr_results:
                         if should_shutdown:
                             break
                             
-                        # First try extracting from the snippet
-                        if verbose:
-                            print(f"\033[34mExtracting from text:\n{attr_result.title}\n{attr_result.snippet}\n{attr_result.url}\033[0m")
-                            
                         try:
+                            if verbose:
+                                print(f"\033[38;5;33mExtracting from text:\n{result.title}\n{result.snippet}\n{result.url}\033[0m\n")
+                                
                             extracted = await gemini.extract_attributes(
-                                f"{attr_result.title}\n{attr_result.snippet}",
-                                attr_result.url,
+                                f"{result.title}\n{result.snippet}",
+                                result.url,
                                 entity_type,
                                 [attr for attr in attributes if attr not in found_attributes]
                             )
                             
                             if extracted:
-                                # Convert to DataFrame row with all columns
-                                row_data = {col: None for col in columns}
-                                row_data.update({
-                                    "name": extracted.get("name"),
-                                    "search_space": search_space
-                                })
-                                
-                                # Add any available attributes
-                                for attr in attributes:
-                                    if attr == 'address' and 'address' in extracted:
-                                        # Handle address components
-                                        row_data.update({
-                                            "address": extracted.get("address"),
-                                            "street_address": extracted.get("street_address"),
-                                            "city": extracted.get("city"),
-                                            "state": extracted.get("state"),
-                                            "zip": extracted.get("zip")
-                                        })
-                                        found_attributes.add('address')
-                                    elif attr in extracted:
-                                        row_data[attr] = extracted[attr]
-                                        found_attributes.add(attr)
-                                
-                                # Create new row with exact column order
-                                new_row = pl.DataFrame([{col: row_data.get(col) for col in columns}])
-                                
-                                try:
-                                    results_df = pl.concat([results_df, new_row], how="vertical")
-                                    if verbose:
-                                        print(f"\nFound {entity_type}: {row_data['name']}")
-                                        for attr in attributes:
-                                            if attr == 'address' and row_data.get('address'):
-                                                print(f"  Address: {row_data['address']}")
-                                                if row_data.get('street_address'):
-                                                    print(f"    Street: {row_data['street_address']}")
-                                                    print(f"    City: {row_data['city']}")
-                                                    print(f"    State: {row_data['state']}")
-                                                    print(f"    ZIP: {row_data['zip']}")
-                                            elif row_data.get(attr):
-                                                print(f"  {attr.title()}: {row_data[attr]}")
-                                except Exception:
-                                    continue
+                                if verbose:
+                                    print(f"\033[38;5;33mExtracted attributes: {extracted}\033[0m")
                                     
-                                # If we found all attributes, skip further searching
-                                if len(found_attributes) == len(attributes):
-                                    continue
-                            
-                        except Exception:
+                                # Create new row data starting with existing row
+                                new_row = dict(results_df.row(i, named=True))
+                                
+                                # Set the enumerated search space item
+                                if space_item:
+                                    new_row['search_space'] = space_item
+                                
+                                # First handle address if present
+                                if 'address' in extracted:
+                                    address = extracted['address']
+                                    parts = address.split(',')
+                                    if len(parts) >= 1:
+                                        new_row['street_address'] = parts[0].strip()
+                                    if len(parts) >= 2:
+                                        city_state = parts[1].strip().split()
+                                        if len(city_state) > 0:
+                                            new_row['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
+                                        if len(city_state) > 1:
+                                            new_row['state'] = city_state[-1]
+                                    if len(parts) >= 3:
+                                        new_row['zip'] = parts[2].strip()
+                                    # Remove the full address after decomposing
+                                    extracted.pop('address')
+                                
+                                # Then update with any other extracted values
+                                for col in results_df.columns:
+                                    if col in extracted:
+                                        new_row[col] = extracted[col]
+                                
+                                # Update DataFrame
+                                results_df = results_df.with_row_count('index').with_columns([
+                                    pl.when(pl.col('index') == i)
+                                    .then(pl.lit(new_row.get(col)))
+                                    .otherwise(pl.col(col))
+                                    .alias(col)
+                                    for col in results_df.columns
+                                ]).drop('index')
+                                
+                                if verbose:
+                                    print(f"\033[38;5;33mUpdated row {i}: {new_row}\033[0m")
+                                    
+                                # Update found attributes
+                                found_attributes.update(extracted.keys())
+                                found_attributes.update(['street_address', 'city', 'state', 'zip'])
+                                    
+                        except Exception as e:
+                            if verbose:
+                                print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")
                             continue
                             
-                        # If we didn't find the attribute in the snippet, try scraping the page
-                        if attr_result.url and not (extracted and attr in extracted):
-                            if verbose:
-                                print(f"\033[34mTrying to scrape page: {attr_result.url}\033[0m")
-                            
-                            page_text = await scraper.scrape_page(attr_result.url)
-                            if page_text:
-                                if verbose:
-                                    print(f"\033[34mExtracted text from page:\n{page_text[:500]}...\033[0m\n")
-                                
-                                try:
-                                    extracted = await gemini.extract_attributes(
-                                        page_text,
-                                        attr_result.url,
-                                        entity_type,
-                                        attributes
-                                    )
-                                    
-                                    if extracted:
-                                        # Convert to DataFrame row with all columns
-                                        row_data = {col: None for col in columns}
-                                        row_data.update({
-                                            "name": extracted.get("name"),
-                                            "search_space": search_space
-                                        })
-                                        
-                                        # Add any available attributes
-                                        for attr in attributes:
-                                            if attr == 'address' and 'address' in extracted:
-                                                # Handle address components
-                                                row_data.update({
-                                                    "address": extracted.get("address"),
-                                                    "street_address": extracted.get("street_address"),
-                                                    "city": extracted.get("city"),
-                                                    "state": extracted.get("state"),
-                                                    "zip": extracted.get("zip")
-                                                })
-                                                found_attributes.add('address')
-                                            elif attr in extracted:
-                                                row_data[attr] = extracted[attr]
-                                                found_attributes.add(attr)
-                                        
-                                        # Create new row with exact column order
-                                        new_row = pl.DataFrame([{col: row_data.get(col) for col in columns}])
-                                        
-                                        try:
-                                            results_df = pl.concat([results_df, new_row], how="vertical")
-                                            if verbose:
-                                                print(f"\nFound {entity_type}: {row_data['name']}")
-                                                for attr in attributes:
-                                                    if attr == 'address' and row_data.get('address'):
-                                                        print(f"  Address: {row_data['address']}")
-                                                        if row_data.get('street_address'):
-                                                            print(f"    Street: {row_data['street_address']}")
-                                                            print(f"    City: {row_data['city']}")
-                                                            print(f"    State: {row_data['state']}")
-                                                            print(f"    ZIP: {row_data['zip']}")
-                                                    elif row_data.get(attr):
-                                                        print(f"  {attr.title()}: {row_data[attr]}")
-                                        except Exception:
-                                            continue
-                                            
-                                except Exception:
-                                    continue
-                                            
-                            break  # Found the attribute, move to next one
-                                            
                 except Exception as e:
                     if verbose:
-                        print(f"\033[31mError searching for {attr}: {str(e)}\033[0m\n")
+                        print(f"\033[38;5;209mError searching for attributes: {str(e)}\033[0m\n")
                     continue
                     
                 progress.update(second_pass, advance=1)
-                
+        
         if should_shutdown:
             return
-            
-        # Remove duplicates
-        results_df = results_df.unique(subset=['name'])
         
         # Save results
         if not output_file:

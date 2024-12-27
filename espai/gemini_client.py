@@ -226,63 +226,106 @@ search_space: none"""
                 print(f"\033[38;5;209mError parsing query: {str(e)}\033[0m\n")  # Light orange color
             raise
     
-    async def enumerate_search_space(self, search_space: str) -> List[str]:
-        """Enumerate items in a search space.
-        
-        Args:
-            search_space: Description of the search space
-            
-        Returns:
-            List of items in the search space
-        """
-        prompt = f"""Enumerate all items in this search space:
-"{search_space}"
-
-Return a JSON array of strings. For geographic areas, use official names.
-For example, for "New England states" return:
-[
-    "Maine",
-    "New Hampshire",
-    "Vermont",
-    "Massachusetts",
-    "Rhode Island",
-    "Connecticut"
-]"""
-        
-        return await self._generate_and_parse_json(prompt)
-    
-    async def extract_attributes(self, text: str, url: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, str]]:
-        """Extract requested attributes from text.
-        
-        Args:
-            text: Text to extract from
-            url: URL the text came from
-            entity_type: Type of entity to extract
-            attributes: List of attributes to extract
-            
-        Returns:
-            Dictionary of extracted attributes or None if failed
-        """
-        prompt = f"""Extract information about this {entity_type} from the following text:
-
-Text: {text}
-URL: {url}
-
-Extract these attributes:
-{', '.join(attributes)}
+    async def enumerate_search_space(self, search_space: str) -> Optional[List[str]]:
+        """Enumerate the search space into specific items."""
+        prompt = f"""Enumerate the specific items in this search space: {search_space}
 
 Rules:
-1. Only include attributes that are explicitly mentioned in the text
-2. Do not guess or infer values
-3. For addresses, include as much detail as given (street, city, state, zip)
-4. Return values exactly as they appear in text
-5. Omit attributes if no value is found
+1. Return a JSON array of the EXACT items that match the search space
+2. For counties, return the full county name with "County" (e.g., "Collier County")
+3. For states, use standard state abbreviations (e.g., "FL" not "Florida")
+4. Return REAL locations only, not placeholders or generic items
+5. If the search involves rankings (highest, wealthiest, etc), return the actual items in correct order
 
-Return as JSON with the attribute names as keys.
-Example:
-{{
-    "name": "LA Fitness",
-    "address": "123 Main St, Tampa, FL 33601"
+Examples:
+
+Input: "3 highest-income FL counties"
+[
+  "Collier County",
+  "St. Johns County",
+  "Martin County"
+]
+
+Input: "top 2 FL beach cities"
+[
+  "Naples",
+  "Sarasota"
+]
+
+Input: "Miami-Dade neighborhoods"
+[
+  "South Beach",
+  "Coral Gables",
+  "Coconut Grove",
+  "Brickell"
+]"""
+
+        try:
+            response = await self._generate_with_retry(prompt)
+            
+            if hasattr(response, 'parts'):
+                text = '\n'.join(part.text for part in response.parts)
+            else:
+                text = response.text
+                
+            if self.verbose:
+                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")
+                
+            items = self._parse_json_response(text)
+            if not items or not isinstance(items, list):
+                return None
+                
+            return items
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"\033[38;5;209mError enumerating search space: {str(e)}\033[0m\n")
+            return None
+
+    async def extract_attributes(self, text: str, url: str, entity_type: str, attributes: List[str]) -> Optional[Dict[str, str]]:
+        """Extract requested attributes from text."""
+        prompt = f"""Extract ONLY the following attributes for this {entity_type} from the text, if they are explicitly mentioned:
+{', '.join(attributes)}
+
+Text to analyze:
+{text}
+URL: {url}
+
+Rules:
+1. Return a JSON object with ONLY the attributes that are explicitly mentioned in the text
+2. Do NOT include attributes that are not clearly stated in the list of requested attributes
+3. Do NOT make assumptions or infer values
+4. For 'address' (if present in the list of requested attributes):
+   - If you find an address like "123 Main St, Springfield, MA 01234", decompose it into:
+     {{"street_address": "123 Main St", "city": "Springfield", "state": "MA", "zip": "01234"}}
+   - If you find "1515 Golden Gate Parkway, Naples", decompose it into:
+     {{"street_address": "1515 Golden Gate Parkway", "city": "Naples"}}
+   - NEVER return a complete address string - always decompose it
+   - Return each component separately
+   - Omit any components that aren't present
+
+Examples:
+
+Input text: "The Paradise Coast Sports Complex at 3892 City Gate Blvd. South, Naples FL, 34117"
+Output: {{
+    "name": "Paradise Coast Sports Complex",
+    "street_address": "3892 City Gate Blvd. South",
+    "city": "Naples",
+    "state": "FL",
+    "zip": "34117"
+}}
+
+Input text: "Freedom Park at 1515 Golden Gate Parkway, Naples"
+Output: {{
+    "name": "Freedom Park",
+    "street_address": "1515 Golden Gate Parkway",
+    "city": "Naples"
+}}
+
+Input text: "Located in Naples, Florida"
+Output: {{
+    "city": "Naples",
+    "state": "FL"
 }}"""
 
         try:
@@ -294,55 +337,37 @@ Example:
                 text = response.text
                 
             if self.verbose:
-                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
-            
-            # Try to find JSON in the response
-            try:
-                # First check for code blocks
-                code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-                if code_block_match:
-                    try:
-                        return json.loads(code_block_match.group(1))
-                    except:
-                        pass
+                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")
                 
-                # Then try to parse the entire text
-                try:
-                    return json.loads(text.strip())
-                except:
-                    pass
-                
-                # Finally try to find JSON-like content
-                text = text.strip()
-                if text.startswith('{'):
-                    # Find matching closing brace
-                    count = 0
-                    for i, char in enumerate(text):
-                        if char == '{':
-                            count += 1
-                        elif char == '}':
-                            count -= 1
-                            if count == 0:
-                                try:
-                                    return json.loads(text[:i+1])
-                                except:
-                                    pass
-                                break
-                
-                if self.verbose:
-                    print(f"\033[38;5;209mNo JSON found in response\033[0m\n")  # Light orange color
+            extracted = self._parse_json_response(text)
+            if not extracted:
                 return None
+                
+            # If we have a complete address string, decompose it
+            if 'address' in extracted:
+                address = extracted['address']
+                del extracted['address']
+                
+                # Split address into components
+                parts = address.split(',')
+                if len(parts) >= 1:
+                    extracted['street_address'] = parts[0].strip()
+                if len(parts) >= 2:
+                    city_state = parts[1].strip().split()
+                    if len(city_state) > 0:
+                        extracted['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
+                    if len(city_state) > 1:
+                        extracted['state'] = city_state[-1]
+                if len(parts) >= 3:
+                    extracted['zip'] = parts[2].strip()
                     
-            except Exception as e:
-                if self.verbose:
-                    print(f"\033[38;5;209mError parsing JSON: {str(e)}\033[0m\n")  # Light orange color
-                return None
+            return extracted
             
         except Exception as e:
             if self.verbose:
-                print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")  # Light orange color
+                print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")
             return None
-    
+            
     async def parse_search_result(
         self,
         text: str,
@@ -360,3 +385,46 @@ Example:
             Dictionary of extracted attributes or None if no match
         """
         return await self.extract_attributes(text, "", entity_type, attributes)
+
+    def _parse_json_response(self, text: str) -> Optional[Dict]:
+        """Parse a JSON response from the LLM."""
+        try:
+            # First check for code blocks
+            code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+            if code_block_match:
+                try:
+                    return json.loads(code_block_match.group(1))
+                except:
+                    pass
+            
+            # Then try to parse the entire text
+            try:
+                return json.loads(text.strip())
+            except:
+                pass
+            
+            # Finally try to find JSON-like content
+            text = text.strip()
+            if text.startswith('{'):
+                # Find matching closing brace
+                count = 0
+                for i, char in enumerate(text):
+                    if char == '{':
+                        count += 1
+                    elif char == '}':
+                        count -= 1
+                        if count == 0:
+                            try:
+                                return json.loads(text[:i+1])
+                            except:
+                                pass
+                            break
+            
+            if self.verbose:
+                print(f"\033[38;5;209mNo JSON found in response\033[0m\n")  # Light orange color
+            return None
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"\033[38;5;209mError parsing JSON: {str(e)}\033[0m\n")  # Light orange color
+            return None
