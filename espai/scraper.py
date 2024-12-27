@@ -1,114 +1,85 @@
-"""Web scraping utilities for extracting data from search result pages."""
+"""Web scraping utilities."""
 
 import asyncio
 from typing import Optional
 
-import aiohttp
+import httpx
 from bs4 import BeautifulSoup
 
 
 class Scraper:
-    """Web scraper for extracting data from search result pages."""
+    """Simple web scraper."""
     
-    def __init__(self, timeout: int = 10):
-        """Initialize the scraper.
+    def __init__(self):
+        """Initialize the scraper."""
+        self.client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10.0
+        )
         
-        Args:
-            timeout: Default timeout in seconds for requests
-        """
-        self.timeout = timeout
-        self.session = None
-    
-    async def __aenter__(self):
-        """Create aiohttp session when entering context."""
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Close aiohttp session when exiting context."""
-        if self.session:
-            await self.session.close()
-            self.session = None
-    
-    async def scrape_page(self, url: str, timeout: Optional[int] = None) -> Optional[str]:
-        """Scrape a webpage and return its text content.
+    async def close(self):
+        """Close the HTTP client."""
+        await self.client.aclose()
+        
+    async def scrape_page(self, url: str) -> Optional[str]:
+        """Scrape text content from a webpage.
         
         Args:
             url: URL to scrape
-            timeout: Optional timeout override
             
         Returns:
-            Text content of the page, or None if scraping failed
+            Extracted text content or None if failed
         """
-        timeout = timeout or self.timeout
-        
         try:
-            # Create session if needed
-            if not self.session:
-                self.session = aiohttp.ClientSession()
+            # Get the page content
+            response = await self.client.get(url)
             
-            async with self.session.get(
-                url,
-                timeout=timeout,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                }
-            ) as response:
-                if response.status != 200:
-                    return None
+            # Try to detect the encoding
+            if response.encoding is None:
+                # Try to detect from content
+                if response.content.startswith(b'\xef\xbb\xbf'):  # UTF-8 BOM
+                    response.encoding = 'utf-8-sig'
+                else:
+                    # Try common encodings
+                    encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+                    content = None
+                    for encoding in encodings:
+                        try:
+                            content = response.content.decode(encoding)
+                            response.encoding = encoding
+                            break
+                        except UnicodeDecodeError:
+                            continue
                     
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+                    if content is None:
+                        # If all encodings fail, use replace error handler
+                        content = response.content.decode('utf-8', errors='replace')
+                        response.encoding = 'utf-8'
+            
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style", "meta", "link"]):
+                script.decompose()
                 
-                # Remove unwanted elements
-                for element in soup(["script", "style", "meta", "link", "noscript", "iframe"]):
-                    element.decompose()
+            # Extract text
+            text = soup.get_text(separator='\n', strip=True)
+            
+            # Clean up text
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            text = '\n'.join(lines)
+            
+            # Truncate if too long (keep first 1000 chars)
+            if len(text) > 1000:
+                text = text[:1000] + "..."
                 
-                # Replace common block elements with newlines
-                for tag in soup.find_all(["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6"]):
-                    tag.insert_after(soup.new_string("\n"))
-                
-                # Replace list items with bullet points
-                for li in soup.find_all("li"):
-                    li.insert_before(soup.new_string("• "))
-                
-                # Get text and clean it up
-                text = soup.get_text()
-                
-                # Clean up whitespace while preserving structure
-                lines = []
-                for line in text.splitlines():
-                    line = line.strip()
-                    if line:  # Skip empty lines
-                        # Preserve certain punctuation by ensuring spaces around it
-                        for char in [",", ".", ":", ";", "•"]:
-                            line = line.replace(char + " ", char)  # Remove extra space after punctuation
-                        lines.append(line)
-                
-                # Join with newlines and remove excessive whitespace
-                text = "\n".join(lines)
-                text = " ".join(text.split())  # Normalize whitespace within lines
-                
-                # Remove duplicate newlines while preserving paragraph structure
-                while "\n\n\n" in text:
-                    text = text.replace("\n\n\n", "\n\n")
-                
-                # Truncate if too long (Gemini has a context limit)
-                if len(text) > 10000:
-                    # Try to truncate at a sentence boundary
-                    truncate_point = text[:10000].rfind(".")
-                    if truncate_point > 0:
-                        text = text[:truncate_point + 1]
-                    else:
-                        text = text[:10000] + "..."
-                
-                return text
-                
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            return text
+            
+        except Exception as e:
+            print(f"\033[31mError scraping {url}: {str(e)}\033[0m\n")
             return None
-        
+            
         finally:
-            # Don't close the session here - let it be reused
-            pass
+            # Ensure we don't keep too many connections open
+            await asyncio.sleep(0.1)

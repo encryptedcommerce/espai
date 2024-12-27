@@ -91,36 +91,91 @@ class GeminiClient:
         self,
         query: str
     ) -> Tuple[str, List[str], Optional[str]]:
-        """Parse a natural language query into structured components.
-        
-        Args:
-            query: Natural language query string
+        """Parse a natural language query into structured components."""
+        prompt = f"""Parse this query into structured components:
+{query}
+
+Output format:
+entity_type: <type of entity being searched for>
+attributes: <list of attributes to extract, comma separated>
+search_space: <optional geographic or domain-specific scope>
+
+Rules:
+1. entity_type should be a singular noun (e.g. "company" not "companies")
+2. attributes should be normalized:
+   - "name" and "names" -> "name"
+   - "website" and "websites" -> "website"
+   - "phone" and "phones" -> "phone"
+   - "email" and "emails" -> "email"
+3. search_space should capture any geographic or domain constraints
+4. if no search_space is specified, output "none"
+
+Example 1:
+Query: "find tech companies in california with their websites and phone numbers"
+Output:
+entity_type: company
+attributes: website,phone
+search_space: california
+
+Example 2:
+Query: "list universities with email addresses"
+Output:
+entity_type: university
+attributes: email
+search_space: none"""
+
+        try:
+            response = self.model.generate_content(prompt)
+            if self.verbose:
+                print(f"\033[34mGemini Response:\n{response.text}\033[0m\n")
             
-        Returns:
-            Tuple of (entity_type, attributes, search_space)
-        """
-        prompt = f"""Parse this search query into structured components:
-"{query}"
-
-Return a JSON object with these fields:
-- entity: The type of entity being searched for (e.g. "restaurants", "doctors")
-- attributes: List of attributes to extract (e.g. ["name", "address", "phone"])
-- search_space: The scope or area to search within (e.g. "New York City", "California zip codes"), or null if not specified
-
-Example response:
-{{
-    "entity": "restaurants",
-    "attributes": ["name", "address", "phone"],
-    "search_space": "Manhattan"
-}}"""
-        
-        result = await self._generate_and_parse_json(prompt)
-        
-        return (
-            result["entity"],
-            result["attributes"],
-            result.get("search_space")
-        )
+            # Parse response
+            lines = response.text.strip().split('\n')
+            entity_type = None
+            attributes = []
+            search_space = None
+            
+            for line in lines:
+                if ':' not in line:
+                    continue
+                    
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip().lower()
+                
+                if key == 'entity_type':
+                    entity_type = value
+                elif key == 'attributes':
+                    # Split and clean attributes
+                    attrs = [a.strip() for a in value.split(',')]
+                    # Normalize attribute names
+                    normalized = []
+                    for attr in attrs:
+                        if attr in ['name', 'names']:
+                            continue  # Skip 'name' since it's always included
+                        elif attr in ['website', 'websites']:
+                            normalized.append('website')
+                        elif attr in ['phone', 'phones']:
+                            normalized.append('phone')
+                        elif attr in ['email', 'emails']:
+                            normalized.append('email')
+                        elif attr in ['director', 'directors']:
+                            normalized.append('director')
+                        else:
+                            normalized.append(attr)
+                    attributes = normalized
+                elif key == 'search_space' and value != 'none':
+                    search_space = value
+            
+            if not entity_type:
+                raise ValueError("No entity type found in response")
+            
+            return entity_type, attributes, search_space
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"\033[31mError parsing query: {str(e)}\033[0m\n")
+            raise
     
     async def enumerate_search_space(self, search_space: str) -> List[str]:
         """Enumerate items in a search space.
@@ -153,44 +208,52 @@ For example, for "New England states" return:
         entity_type: str,
         attributes: List[str]
     ) -> Optional[Dict[str, str]]:
-        """Extract structured data from a search result.
+        """Parse a search result to extract requested attributes.
         
         Args:
-            text: Text to extract from
+            text: Text to parse (title + snippet)
             entity_type: Type of entity to extract
             attributes: List of attributes to extract
             
         Returns:
-            Dictionary of extracted attributes, or None if no entity found
+            Dictionary of extracted attributes or None if no match
         """
-        # Build list of attributes with examples
-        attr_examples = {
-            "name": "e.g. 'ACME Fitness Center', 'Gold's Gym'",
-            "address": "e.g. '123 Main St, Springfield, IL 62701', '456 Oak Ave, Chicago, IL 60601'"
-        }
-        
-        attr_list = "\n".join(
-            f"- {attr}: {attr_examples.get(attr, 'any relevant text')}"
-            for attr in attributes
-        )
-        
         prompt = f"""Extract information about a {entity_type} from this text:
+
 {text}
 
-Return a JSON object with these attributes:
-{attr_list}
+Rules:
+1. If the text contains a {entity_type}, extract these attributes: {', '.join(attributes)}
+2. If you can't find a {entity_type}, return "none"
+3. If a URL is provided, use it to help identify the entity name
+4. The name should be the official/formal name of the {entity_type}
+5. Remove any extra text like "Home", "Welcome to", "Official Site of" from names
+6. If you're not confident about the extraction, return "none"
 
-If an attribute is not found, omit it from the response. If no relevant entity is found, return null.
-Do not make up or guess at information - only return what is explicitly stated in the text.
+Example 1:
+Text: "Welcome to Example Corp - Home Page | Leading Tech Solutions"
+URL: example-corp.com
+Output: {{"name": "Example Corp"}}
 
-Example response:
-{{
-    "name": "ACME Fitness Center",
-    "address": "123 Main St, Springfield, IL 62701"
-}}"""
-        
+Example 2:
+Text: "Front Page"
+URL: adrenalinesportsacademy.com
+Output: {{"name": "Adrenaline Sports Academy"}}
+
+Example 3:
+Text: "Page not found"
+URL: example.com/404
+Output: none
+
+Format the output as a JSON object with the extracted attributes as keys.
+If no {entity_type} is found, output "none"."""
+
         try:
             result = await self._generate_and_parse_json(prompt)
-            return result if result and any(result.values()) else None
-        except ValueError:
+            if not result or not isinstance(result, dict):
+                return None
+            return result if any(result.values()) else None
+        except (ValueError, AttributeError):
+            if self.verbose:
+                print(f"\nFailed to parse result from text: {text[:100]}...")
             return None

@@ -32,7 +32,7 @@ class ExaSearchProvider(SearchProvider):
     async def search(
         self,
         query: str,
-        max_results: int = 10,
+        max_results: int = 100,
     ) -> List[SearchResult]:
         """Execute an Exa search query.
         
@@ -59,7 +59,7 @@ class ExaSearchProvider(SearchProvider):
                     "include_domains": [],  # No domain restrictions
                     "exclude_domains": [],
                     "use_autoprompt": True,  # Let Exa optimize the query
-                    "type": "keyword",       # Standard keyword search
+                    "type": "neural",       # Neural search
                 }
             )
             response.raise_for_status()

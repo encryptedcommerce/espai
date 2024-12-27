@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "espai"
-version = "0.1.0"
+version = "0.1.1"
 description = "Enumerate, Search, Parse, and Iterate - A tool for structured data extraction from search results"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
