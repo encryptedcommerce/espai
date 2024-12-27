@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import google.generativeai as genai
@@ -12,81 +13,94 @@ from .rate_limiter import RateLimiter
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    MODEL_NAME = "gemini-2.0-flash-exp"
-    
-    def __init__(self, temperature: float = 0.7, verbose: bool = False):
+    def __init__(self, verbose: bool = False, temperature: float = 0.7):
         """Initialize the Gemini client.
         
         Args:
+            verbose: Whether to show verbose output
             temperature: Temperature for generation (0.0 to 1.0)
-            verbose: Whether to print debug information
         """
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError("Gemini API key not provided")
-        
         self.verbose = verbose
-        self.temperature = temperature
-        self.rate_limiter = RateLimiter(
-            base_delay=0.5,  # 0.5 second between requests
-            max_delay=32.0,  # Max 32 second delay
-            max_retries=6    # Up to 6 retries
+        
+        # Configure Gemini with API key
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable not set")
+            
+        genai.configure(api_key=api_key)
+        
+        self.model = genai.GenerativeModel(
+            model_name="gemini-pro",
+            generation_config=genai.types.GenerationConfig(
+                temperature=temperature
+            )
         )
         
-        # Configure the Gemini API
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.MODEL_NAME)  # Use MODEL_NAME class constant
-    
     async def _generate_with_retry(self, prompt: str) -> str:
         """Generate text with retries and rate limiting."""
         async def _generate():
             response = await self.model.generate_content_async(
-                prompt,
-                generation_config={"temperature": self.temperature}
+                prompt
             )
-            return response.text
+            return response
             
         try:
-            result = await self.rate_limiter.execute(_generate)
+            result = await RateLimiter(
+                base_delay=0.5,  # 0.5 second between requests
+                max_delay=32.0,  # Max 32 second delay
+                max_retries=6    # Up to 6 retries
+            ).execute(_generate)
             return result
         except Exception as e:
             if self.verbose:
                 print(f"\n[Error] Generation failed: {str(e)}")
             raise
     
-    async def _generate_and_parse_json(self, prompt: str) -> Any:
-        """Generate content and parse it as JSON."""
-        try:
-            text = await self._generate_with_retry(prompt)
-            text = self._clean_json_text(text)
-            
-            # Check for truncation
-            if text.count('[') != text.count(']'):
-                if self.verbose:
-                    print("Warning: Response appears to be truncated")
-                # Try to fix truncated array by finding last complete item
-                last_comma = text.rfind(',')
-                if last_comma != -1:
-                    text = text[:last_comma] + ']'
-            
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse Gemini response as JSON. Response: {text}")
-    
-    def _clean_json_text(self, text: str) -> str:
-        """Clean up text to extract JSON content."""
-        # Find the first { or [ and last } or ]
-        start = min(
-            (text.find('{'), text.find('[')),
-            key=lambda x: float('inf') if x == -1 else x
-        )
-        end = max(text.rfind('}'), text.rfind(']')) + 1
+    async def _generate_and_parse_json(self, prompt: str) -> Optional[Dict]:
+        """Generate a response and parse it as JSON.
         
-        if start == -1 or end == 0:
-            raise ValueError("No JSON content found in response")
+        Args:
+            prompt: Prompt to send to the model
             
-        return text[start:end]
-    
+        Returns:
+            Parsed JSON response or None if failed
+        """
+        try:
+            response = await self._generate_with_retry(prompt)
+            
+            if self.verbose:
+                # Handle multi-part responses
+                if hasattr(response, 'parts'):
+                    text = '\n'.join(part.text for part in response.parts)
+                else:
+                    text = response.text
+                print(f"\033[34mGemini Response:\n{text}\033[0m\n")
+            
+            # Extract text from response
+            if hasattr(response, 'parts'):
+                text = '\n'.join(part.text for part in response.parts)
+            else:
+                text = response.text
+                
+            # Try to find JSON in the response
+            try:
+                # First try to parse the entire response as JSON
+                return json.loads(text)
+            except json.JSONDecodeError:
+                # If that fails, try to find JSON-like content
+                matches = re.findall(r'\{[^}]+\}', text)
+                if matches:
+                    return json.loads(matches[0])
+                else:
+                    if self.verbose:
+                        print(f"\033[31mNo JSON found in response\033[0m\n")
+                    return None
+                    
+        except Exception as e:
+            if self.verbose:
+                print(f"\033[31mError generating response: {str(e)}\033[0m\n")
+            return None
+            
     async def parse_query(
         self,
         query: str
@@ -125,12 +139,19 @@ attributes: email
 search_space: none"""
 
         try:
-            response = self.model.generate_content(prompt)
+            response = await self._generate_with_retry(prompt)
+            
+            # Handle multi-part responses
+            if hasattr(response, 'parts'):
+                text = '\n'.join(part.text for part in response.parts)
+            else:
+                text = response.text
+                
             if self.verbose:
-                print(f"\033[34mGemini Response:\n{response.text}\033[0m\n")
+                print(f"\033[34mGemini Response:\n{text}\033[0m\n")
             
             # Parse response
-            lines = response.text.strip().split('\n')
+            lines = text.strip().split('\n')
             entity_type = None
             attributes = []
             search_space = None

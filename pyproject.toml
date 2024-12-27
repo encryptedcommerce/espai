@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "espai"
-version = "0.1.1"
+version = "0.2.1"
 description = "Enumerate, Search, Parse, and Iterate - A tool for structured data extraction from search results"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Leonardo Gonzalez <leonardo@encryptedcommerce.net>"]
 readme = "README.md"
 packages = [{include = "espai"}]
 

@@ -1,132 +1,187 @@
-# espai (Enumerate, Search, Parse, and Iterate)
+# espai
 
-A powerful tool for structured data extraction from search results using Google Search or Exa.ai with Gemini AI.
+Enumerate, Search, Parse, and Iterate - A tool for structured data extraction from search results
+
+## Overview
+
+Espai is a command-line tool that combines search engines, web scraping, and LLMs to extract structured data from the web. It can find entities (like companies, schools, or government agencies) and extract specific attributes about them (like websites, phone numbers, or addresses).
+
+## Architecture
+
+Espai is built with a modular architecture that combines several components:
+
+### 1. Query Understanding
+- Uses Google's Gemini LLM to parse natural language queries into:
+  - Entity type (what we're looking for)
+  - Attributes (what information to extract)
+  - Search space (geographic or domain constraints)
+- Example: "find tech companies in california with their websites and phone numbers"
+  - Entity: company
+  - Attributes: website, phone
+  - Search space: california
+
+### 2. Search Providers
+- Pluggable search provider interface supporting multiple backends:
+  - Google Custom Search API
+  - Exa.ai API (with neural search)
+- Each provider returns normalized SearchResult objects containing:
+  - Title
+  - Snippet
+  - URL
+  - Domain
+  - Published date
+
+### 3. Entity Extraction
+- Two-pass approach:
+  1. First pass: Find entities matching the query
+     - Uses search results to identify entity names
+     - Deduplicates entities based on normalized names
+  2. Second pass: Extract requested attributes
+     - Uses targeted searches for each attribute
+     - Scrapes web pages when needed
+     - Updates existing entities with new information
+
+### 4. Web Scraping
+- Asynchronous web scraping with httpx
+- Robust text extraction:
+  - Handles multiple character encodings
+  - Removes irrelevant HTML elements
+  - Cleans and normalizes text
+  - Truncates long content for LLM processing
+
+### 5. LLM Processing
+- Uses Gemini for multiple tasks:
+  - Query parsing
+  - Entity name extraction
+  - Attribute extraction
+  - Search space enumeration
+- Custom prompts ensure consistent and clean output
+
+### 6. Data Management
+- Stores results in EntityResult objects with fields for:
+  - Name
+  - Search space
+  - Website
+  - Phone
+  - Email
+  - Address components
+- Supports multiple output formats:
+  - CSV
+  - JSON
+  - Parquet
+
+## How It Works
+
+1. **Query Processing**:
+   - User inputs a natural language query
+   - Gemini parses it into structured components
+   - Search space is enumerated if needed (e.g., "all New England states")
+
+2. **Entity Discovery**:
+   - Primary search provider finds potential entities
+   - Results are processed to extract entity names
+   - Entities are deduplicated and normalized
+
+3. **Attribute Enrichment**:
+   - For each entity, missing attributes are identified
+   - Targeted searches find attribute information
+   - Web pages are scraped when needed
+   - LLM extracts structured data from text
+
+4. **Result Management**:
+   - Results are continuously updated and deduplicated
+   - Progress is shown in real-time
+   - Results can be saved even if interrupted
+   - Output is formatted according to user preference
 
 ## Features
 
-- Parse natural language queries into structured search parameters
-- Automatically discover and enumerate search spaces
-- Multiple search providers (Google Custom Search, Exa.ai)
-- Extract structured data from search results using Gemini AI
-- Store results in efficient Polars DataFrames
-- Real-time progress tracking
+- Natural language query interface
+- Multiple search provider support (Google and Exa.ai)
+- Asynchronous operation for better performance
+- Robust error handling and recovery
+- Clean shutdown with result saving
 - Multiple output formats (CSV, JSON, Parquet)
+- Progress tracking with rich console output
+- Verbose mode for debugging
 
 ## Installation
 
-### From PyPI
 ```bash
 pip install espai
 ```
 
-### From Source
+Or with Poetry:
 ```bash
-git clone https://github.com/yourusername/espai.git
-cd espai
-poetry install
+poetry add espai
 ```
 
-## API Key Setup
+## Configuration
 
-### Google Custom Search
-1. Create a Google Custom Search Engine:
-   - Go to [Google Programmable Search Engine](https://programmablesearchengine.google.com/controlpanel/all)
-   - Click "Add" to create a new search engine
-   - Under "Sites to search", select "Search the entire web" for unrestricted search
-   - Click "Create"
-   - Copy your "Search engine ID" (this will be your GOOGLE_CSE_ID)
+You'll need to set up the following environment variables:
 
-2. Get a Google API Key:
-   - Go to [Google Cloud Console](https://console.cloud.google.com/)
-   - Create a new project or select an existing one
-   - Enable the "Custom Search API" for your project
-   - Go to "Credentials" and create an API key (this will be your GOOGLE_API_KEY)
-
-3. Set environment variables:
 ```bash
-export GOOGLE_API_KEY="your_google_api_key"
-export GOOGLE_CSE_ID="your_search_engine_id"
-```
+# Required for Google Custom Search
+GOOGLE_API_KEY=your_google_api_key
+GOOGLE_CSE_ID=your_custom_search_engine_id
 
-### Exa.ai (Optional)
-1. Sign up at [Exa.ai](https://exa.ai)
-2. Get your API key from the dashboard
-3. Set environment variable:
-```bash
-export EXA_API_KEY="your_exa_api_key"
-```
+# Required for Exa.ai search
+EXA_API_KEY=your_exa_api_key
 
-### Gemini AI
-1. Go to [Google AI Studio API Keys](https://aistudio.google.com/apikey)
-2. Create an API key (no credit card required)
-3. Set environment variable:
-```bash
-export GEMINI_API_KEY="your_gemini_api_key"
+# Required for Gemini AI
+GEMINI_API_KEY=your_gemini_api_key
 ```
 
 ## Usage
 
 Basic usage:
 ```bash
-espai "Athletic center names and addresses in all California zip codes"
+espai "tech companies in San Francisco with their websites"
 ```
 
 With options:
 ```bash
-espai "Athletic center names and addresses in all California zip codes" \
-  --max-results=10 \
-  --output-format=csv \
-  --provider=exa
+espai "department of education websites for all US states" \
+  --max-results 20 \
+  --output-format json \
+  --output-file results.json \
+  --verbose
 ```
 
 Available options:
-- `--max-results`, `-n`: Maximum number of results per search (default: 10)
-- `--output-format`, `-f`: Output format: csv, json, or parquet (default: csv)
-- `--output-file`, `-o`: Output file path (default: results.[format])
-- `--verbose`, `-v`: Show verbose output
-- `--temperature`, `-t`: Temperature for LLM generation (0.0 to 1.0)
-- `--provider`, `-p`: Search provider: google or exa (default: google)
-
-## Search Provider Comparison
-
-### Google Custom Search
-- Pros:
-  - More precise keyword matching
-  - Better for finding specific attributes
-  - Reliable and stable API
-- Cons:
-  - Limited to 100 queries per day on free tier
-  - Maximum 10 results per query
-  - Requires setting up a custom search engine
-
-### Exa.ai
-- Pros:
-  - Better semantic understanding
-  - Returns more context in results
-  - Up to 100 results per query
-  - No need to set up a search engine
-- Cons:
-  - May be less precise for specific attribute searches
-  - API is newer and may change
-  - Requires paid subscription for production use
+- `--max-results, -n`: Maximum results per search (default: 10)
+- `--output-format, -f`: Output format: csv, json, or parquet (default: csv)
+- `--output-file, -o`: Output file (default: results.[format])
+- `--verbose, -v`: Show verbose output
+- `--provider, -p`: Search provider: google or exa (default: google)
+- `--temperature, -t`: Temperature for LLM generation (default: 0.7)
 
 ## Example Queries
 
-Find businesses:
+Find companies:
 ```bash
-espai "Coffee shop names and addresses in Seattle neighborhoods"
+espai "tech startups in Boston with websites and phone numbers"
 ```
 
-Research organizations:
+Find organizations:
 ```bash
-espai "Research labs working on AI in Massachusetts universities"
+espai "environmental nonprofits in California with email addresses"
 ```
 
-Gather event information:
+Find people:
 ```bash
-espai "Tech conferences and their dates in European cities in 2024"
+espai "state governors with their official websites"
 ```
+
+Find locations:
+```bash
+espai "national parks in Utah with visitor center addresses"
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License
+MIT License - see LICENSE file for details.
