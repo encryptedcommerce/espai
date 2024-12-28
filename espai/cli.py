@@ -397,7 +397,7 @@ async def search(
 
                         try:
                             if verbose:
-                                left_text = "{gray}Extracting from text:{end_color}\n" + \
+                                left_text = f"{gray}Extracting from text:{end_color}\n" + \
                                           f"{green}{result.title}{end_color}\n" + \
                                           f"{green}{result.snippet}{end_color}\n" + \
                                           f"{green}{result.url}{end_color}"
@@ -425,7 +425,7 @@ async def search(
 
                             if extracted:
                                 if verbose:
-                                    right_text = "{gray}LLM Attribute Extraction:{end_color}\n" + \
+                                    right_text = f"{gray}LLM Attribute Extraction:{end_color}\n" + \
                                         blue + \
                                         json.dumps(extracted, indent=2) + \
                                         end_color
