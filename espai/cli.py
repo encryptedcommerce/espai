@@ -32,6 +32,13 @@ _current_attributes = []
 _global_output_format = None
 _global_output_file = None
 
+gray = "\033[38;5;240m"
+green = "\033[38;5;34m"
+blue = "\033[38;5;33m"
+purple = "\033[38;5;12m"
+red = "\033[38;5;209m"
+end_color = "\033[0m"
+
 # Output format options
 class OutputFormat(str, Enum):
     """Output format options."""
@@ -274,14 +281,6 @@ async def search(
 
                         try:
                             if verbose:
-                                # Gray color for headers
-                                gray = "\033[38;5;240m"
-                                # Green color for title and URL
-                                green = "\033[38;5;34m"
-                                # Blue color for JSON
-                                blue = "\033[38;5;33m"
-                                end_color = "\033[0m"
-
                                 left_text = f"{gray}Found entity in: {green}{result.url}{end_color}\n" + \
                                           f"{green}{result.title}{end_color}\n" + \
                                           f"{green}{result.snippet}{end_color}" 
@@ -378,7 +377,9 @@ async def search(
                         attr_query += f" in {space_item}"
 
                     if verbose:
-                        print(f"\033[38;5;12mSearching for attributes: {attr_query}\033[0m")
+                        left_text = f"{purple}Searching for attributes:{end_color}"
+                        right_text = f"{purple}{attr_query}{end_color}"
+                        print(format_two_columns(left_text, right_text))
 
                     # Search for attributes
                     attr_results = await search.search(
@@ -396,10 +397,10 @@ async def search(
 
                         try:
                             if verbose:
-                                left_text = "Extracting from text:\n" + \
-                                          f"{result.title}\n" + \
-                                          f"{result.snippet}\n" + \
-                                          f"{result.url}"
+                                left_text = "{gray}Extracting from text:{end_color}\n" + \
+                                          f"{green}{result.title}{end_color}\n" + \
+                                          f"{green}{result.snippet}{end_color}\n" + \
+                                          f"{green}{result.url}{end_color}"
 
                             # Only scrape if enabled
                             content = ""
@@ -408,7 +409,7 @@ async def search(
                                     content = await scraper.scrape(result.url)
                                 except Exception as e:
                                     if verbose:
-                                        print(f"\033[38;5;209mError scraping {result.url}: {str(e)}\033[0m\n")
+                                        print(f"{red}Error scraping {result.url}: {str(e)}{end_color}\n")
                                     content = ""
 
                             text = f"{result.title}\n{result.snippet}"
@@ -424,9 +425,10 @@ async def search(
 
                             if extracted:
                                 if verbose:
-                                    right_text = "LLM Response:\n```json\n" + \
-                                              json.dumps(extracted, indent=2) + \
-                                              "\n```"
+                                    right_text = "{gray}LLM Attribute Extraction:{end_color}\n" + \
+                                        blue + \
+                                        json.dumps(extracted, indent=2) + \
+                                        end_color
                                     print(format_two_columns(left_text, right_text))
 
                             if extracted:
