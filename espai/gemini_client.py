@@ -173,9 +173,6 @@ search_space: none"""
             else:
                 text = response.text
                 
-            if self.verbose:
-                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
-            
             # Parse response
             lines = text.strip().split('\n')
             entity_type = None
@@ -265,9 +262,6 @@ Input: "Miami-Dade neighborhoods"
                 text = '\n'.join(part.text for part in response.parts)
             else:
                 text = response.text
-                
-            if self.verbose:
-                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")
                 
             items = self._parse_json_response(text)
             if not items or not isinstance(items, list):

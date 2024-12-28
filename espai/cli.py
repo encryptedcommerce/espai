@@ -7,6 +7,7 @@ import shutil
 import textwrap
 from typing import Dict, List, Optional
 from enum import Enum
+import re
 
 import polars as pl
 import typer
@@ -51,7 +52,7 @@ def write_results(results: List[EntityResult], fmt: OutputFormat, file: str, req
     """Write results to file in specified format."""
     if not results:
         return
-        
+
     # Deduplicate results while preserving order
     seen = set()
     unique_results = []
@@ -59,7 +60,7 @@ def write_results(results: List[EntityResult], fmt: OutputFormat, file: str, req
         if result.name.lower() not in seen:
             seen.add(result.name.lower())
             unique_results.append(result)
-    
+
     # Convert to DataFrame with only requested attributes
     base_columns = ['name', 'search_space']
     attribute_columns = []
@@ -69,7 +70,7 @@ def write_results(results: List[EntityResult], fmt: OutputFormat, file: str, req
             attribute_columns.extend(['address', 'street_address', 'city', 'state', 'zip'])
         else:
             attribute_columns.append(attr)
-            
+
     # Remove duplicates while preserving order
     columns = base_columns + list(dict.fromkeys(attribute_columns))
     result_dicts = []
@@ -84,9 +85,9 @@ def write_results(results: List[EntityResult], fmt: OutputFormat, file: str, req
             if attr != "name":  # name is already included
                 result_dict[attr] = getattr(r, attr, None)
         result_dicts.append(result_dict)
-    
+
     df = pl.DataFrame(result_dicts)
-    
+
     # Write to file
     if fmt == OutputFormat.CSV:
         df.write_csv(file)
@@ -99,7 +100,7 @@ def signal_handler(signum, frame):
     """Handle interrupt signal."""
     global should_shutdown
     should_shutdown = True
-    
+
     # Write any results we have
     if _current_results:
         status_console.print("\n[yellow]Received interrupt signal. Please wait a few moments while writing results...[/yellow]")
@@ -107,7 +108,7 @@ def signal_handler(signum, frame):
         status_console.print(f"[green]Successfully wrote {len(_current_results)} results.[/green]")
     else:
         status_console.print("\n[yellow]Received interrupt signal. No results to write.[/yellow]")
-    
+
     # Force exit after writing results
     import sys
     sys.exit(0)
@@ -170,29 +171,29 @@ async def search(
     )
 ):
     """Search and extract structured data from the web."""
-    
+
     # Initialize global variables for signal handler
     global _current_results, _current_attributes, _global_output_format, _global_output_file
     _current_results = []
     _current_attributes = []
     _global_output_format = output_format
     _global_output_file = output_file or f"results.{output_format.lower()}"
-    
+
     results = []
     entity_type = None
     attributes = []
     search_space = None
-    
+
     try:
         gemini = GeminiClient(verbose=verbose, temperature=temperature)
         search = get_search_provider(provider)
         google_search = GoogleSearchProvider()  # For attribute searches
         scraper = Scraper() if scrape else None
-        
+
         # Parse the query
         if verbose:
             console.print("[yellow]Parsing query...[/yellow]")
-            
+
         entity_type, attributes, search_space = await gemini.parse_query(query)
         # Update global attributes right after parsing
         _current_attributes = attributes
@@ -200,10 +201,10 @@ async def search(
             console.print(f"Entity Type: {entity_type}")
             console.print(f"Attributes: {attributes}")
             console.print(f"Search Space: {search_space}")
-            
+
         if should_shutdown:
             return
-            
+
         # Create progress bars
         progress = Progress(
             SpinnerColumn(),
@@ -213,16 +214,16 @@ async def search(
             TimeElapsedColumn(),
             console=status_console
         )
-        
+
         # Initialize empty DataFrame with all columns
         columns = ['name', 'search_space'] + attributes
         if 'address' in attributes:
             # Add address component columns
             columns.extend(['street_address', 'city', 'state', 'zip'])
-        
+
         # Initialize empty DataFrame
         results_df = pl.DataFrame(schema={col: pl.Utf8 for col in columns})
-        
+
         # Enumerate search space if needed
         enumerated_space = None
         if search_space:
@@ -236,80 +237,85 @@ async def search(
             except Exception as e:
                 if verbose:
                     print(f"\033[38;5;209mError enumerating search space: {str(e)}\033[0m\n")
-        
+
         # First pass - get entities from search space
         with progress:
             first_pass = progress.add_task(
                 "[cyan]Finding entities...",
                 total=len(enumerated_space) if enumerated_space else 1
             )
-            
+
             # Track found entities to avoid duplicates
             found_entities = set()
-            
+
             # Search within each enumerated item or the general search space
             search_spaces_to_try = enumerated_space if enumerated_space else [search_space]
             for space_item in search_spaces_to_try:
                 if should_shutdown:
                     break
-                    
+
                 # Build search query
                 if space_item:
                     search_query = f"{entity_type} in {space_item}"
                 else:
                     search_query = entity_type
-                    
+
                 try:
                     # Search for entities
                     entity_results = await search.search(
                         search_query,
                         max_results=max_results
                     )
-                    
+
                     # Extract entity names from results
                     for result in entity_results:
                         if should_shutdown:
                             break
-                            
+
                         try:
                             if verbose:
-                                left_text = "Found entity in:\n" + \
-                                          f"{result.title}\n" + \
-                                          f"{result.snippet}\n" + \
-                                          f"{result.url}"
-                                  
+                                # Gray color for headers
+                                gray = "\033[38;5;240m"
+                                # Green color for title and URL
+                                green = "\033[38;5;34m"
+                                # Blue color for JSON
+                                blue = "\033[38;5;33m"
+                                end_color = "\033[0m"
+
+                                left_text = f"{gray}Found entity in: {green}{result.url}{end_color}\n" + \
+                                          f"{green}{result.title}{end_color}\n" + \
+                                          f"{green}{result.snippet}{end_color}" 
+
                             extracted = await gemini.extract_attributes(
                                 f"{result.title}\n{result.snippet}",
                                 result.url,
                                 entity_type,
                                 ["name"]  # Only look for name in first pass
                             )
-                                
+
                             if extracted and "name" in extracted:
                                 entity_name = extracted["name"]
                                 if entity_name not in found_entities:
                                     found_entities.add(entity_name)
-                                    
+
                                     if verbose:
-                                        right_text = "Gemini Response:\n```json\n" + \
-                                                  json.dumps({"name": entity_name}, indent=2) + \
-                                                  "\n```"
+                                        right_text = f"{gray}LLM Entity Extraction:{end_color}\n" + \
+                                                  f"{blue}    {entity_name}{end_color}"
                                         print(format_two_columns(left_text, right_text))
-                                        print("─" * (shutil.get_terminal_size().columns))
-                                    
+
                                     # Initialize row with name and search space
                                     row_data = {col: None for col in columns}
                                     row_data.update({
                                         "name": entity_name,
                                         "search_space": space_item  # Use the enumerated item instead of original search space
                                     })
-                                    
+
                                     # Add to DataFrame
                                     results_df = pl.concat([
                                         results_df,
                                         pl.DataFrame([row_data], schema=results_df.schema)
                                     ], how="vertical")
-                                    
+
                                     # Update current results for signal handler
                                     _current_results.append(EntityResult(
                                         name=row_data['name'],
@@ -323,78 +329,78 @@ async def search(
                                         state=row_data.get('state'),
                                         zip=row_data.get('zip')
                                     ))
-                                    
+
                                     # Stop if we found all entities
                                     if len(found_entities) == max_results:
                                         break
-                                        
+
                         except Exception as e:
                             if verbose:
                                 print(f"\033[38;5;209mError extracting entity: {str(e)}\033[0m\n")
                             continue
-                            
+
                 except Exception as e:
                     if verbose:
                         print(f"\033[38;5;209mError searching for entities: {str(e)}\033[0m\n")
                     continue
-                    
+
                 progress.update(first_pass, advance=1)
-                
+
         if should_shutdown:
             return
-            
+
         # Second pass - get attributes for each entity
         with progress:
             second_pass = progress.add_task(
                 "[cyan]Getting attributes...",
                 total=len(results_df)
             )
-            
+
             # Process each found entity
             for i in range(len(results_df)):
                 if should_shutdown:
                     break
-                    
+
                 row = results_df.row(i, named=True)
                 entity_name = row['name']
-                
+
                 # Get the specific enumerated item for this row
                 space_item = None
                 if enumerated_space and len(enumerated_space) > 0:
                     space_item = enumerated_space[i % len(enumerated_space)]
                 else:
                     space_item = search_space
-                        
+
                 try:
                     # Build attribute search query
                     attr_query = f"{entity_name} {' '.join(attributes)}"
                     if space_item:
                         attr_query += f" in {space_item}"
-                        
+
                     if verbose:
                         print(f"\033[38;5;12mSearching for attributes: {attr_query}\033[0m")
-                        
+
                     # Search for attributes
                     attr_results = await search.search(
                         attr_query,
                         max_results=max_results
                     )
-                    
+
                     # Track which attributes we've found
                     found_attributes = set()
-                    
+
                     # Extract attributes from results
                     for result in attr_results:
                         if should_shutdown:
                             break
-                            
+
                         try:
                             if verbose:
                                 left_text = "Extracting from text:\n" + \
                                           f"{result.title}\n" + \
                                           f"{result.snippet}\n" + \
                                           f"{result.url}"
-                                              
+
                             # Only scrape if enabled
                             content = ""
                             if scraper:
@@ -404,61 +410,68 @@ async def search(
                                     if verbose:
                                         print(f"\033[38;5;209mError scraping {result.url}: {str(e)}\033[0m\n")
                                     content = ""
-                            
+
                             text = f"{result.title}\n{result.snippet}"
                             if content:
                                 text += f"\n{content}"
-                                              
+
                             extracted = await gemini.extract_attributes(
                                 text,
                                 result.url,
                                 entity_type,
                                 [attr for attr in attributes if attr not in found_attributes]
                             )
-                                
+
                             if extracted:
                                 if verbose:
-                                    right_text = "Gemini Response:\n```json\n" + \
+                                    right_text = "LLM Response:\n```json\n" + \
                                               json.dumps(extracted, indent=2) + \
                                               "\n```"
                                     print(format_two_columns(left_text, right_text))
-                            
+
                             if extracted:
                                 # Create new row data starting with existing row
                                 new_row = dict(results_df.row(i, named=True))
-                                
+
                                 # Set the enumerated search space item
                                 if space_item:
                                     new_row['search_space'] = space_item
-                                
+
                                 # First handle address if present
                                 if 'address' in extracted:
                                     address = extracted['address']
-                                    parts = address.split(',')
-                                    if len(parts) >= 1:
-                                        new_row['street_address'] = parts[0].strip()
-                                    if len(parts) >= 2:
-                                        city_state = parts[1].strip().split()
-                                        if len(city_state) > 0:
-                                            new_row['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
-                                        if len(city_state) > 1:
-                                            new_row['state'] = city_state[-1]
-                                    if len(parts) >= 3:
-                                        new_row['zip'] = parts[2].strip()
+                                    # Handle case where address is already a dictionary
+                                    if isinstance(address, dict):
+                                        for field in ['street_address', 'city', 'state', 'zip']:
+                                            if field in address:
+                                                new_row[field] = address[field]
+                                    else:
+                                        # Parse address string
+                                        parts = address.split(',')
+                                        if len(parts) >= 1:
+                                            new_row['street_address'] = parts[0].strip()
+                                        if len(parts) >= 2:
+                                            city_state = parts[1].strip().split()
+                                            if len(city_state) > 0:
+                                                new_row['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
+                                            if len(city_state) > 1:
+                                                new_row['state'] = city_state[-1]
+                                        if len(parts) >= 3:
+                                            new_row['zip'] = parts[2].strip()
                                     # Remove the full address after decomposing
                                     extracted.pop('address')
-                                
+
                                 # Then update with any other extracted values
                                 for col in results_df.columns:
                                     if col in extracted:
                                         new_row[col] = extracted[col]
-                                
+
                                 # Update the DataFrame with the new row
                                 results_df = pl.concat([
                                     results_df,
                                     pl.DataFrame([new_row], schema=results_df.schema)
                                 ], how="vertical")
-                                
+
                                 # Update current results for signal handler
                                 _current_results = [
                                     EntityResult(
@@ -475,30 +488,30 @@ async def search(
                                     )
                                     for row in results_df.to_dicts()
                                 ]
-                                
+
                                 # Update found attributes
                                 found_attributes.update(extracted.keys())
                                 found_attributes.update(['street_address', 'city', 'state', 'zip'])
-                                    
+
                         except Exception as e:
                             if verbose:
                                 print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")
                             continue
-                            
+
                 except Exception as e:
                     if verbose:
                         print(f"\033[38;5;209mError searching for attributes: {str(e)}\033[0m\n")
                     continue
-                    
+
                 progress.update(second_pass, advance=1)
-        
+
         if should_shutdown:
             return
-        
+
         # Save results
         if not output_file:
             output_file = f"results.{output_format.value}"
-            
+
         if output_format == OutputFormat.CSV:
             results_df.write_csv(output_file)
         elif output_format == OutputFormat.JSON:
@@ -507,12 +520,12 @@ async def search(
             results_df.write_parquet(output_file)
         else:
             raise ValueError(f"Unsupported output format: {output_format.value}")
-            
+
         status_console.print(f"[green]Wrote {len(results_df)} results to {output_file}[/green]")
-        
+
     except Exception as e:
         console.print(f"[red]Error: {str(e)}[/red]")
-        
+
     finally:
         # Clean up resources
         if isinstance(search, ExaSearchProvider):
@@ -524,33 +537,38 @@ def format_two_columns(left_text: str, right_text: str, color: str = "\033[38;5;
     """Format text in two columns, each taking 50% of terminal width."""
     term_width = shutil.get_terminal_size().columns
     col_width = term_width // 2 - 2  # -2 for padding
-    
+
     # Split texts into lines
     left_lines = left_text.split('\n')
     right_lines = right_text.split('\n')
-    
+
     # Wrap each line to fit column width
     wrapped_left = []
     for line in left_lines:
         wrapped_left.extend(textwrap.wrap(line, width=col_width) or [''])
-        
+
     wrapped_right = []
     for line in right_lines:
         wrapped_right.extend(textwrap.wrap(line, width=col_width) or [''])
-    
+
     # Make both columns same height
     max_lines = max(len(wrapped_left), len(wrapped_right))
     wrapped_left.extend([''] * (max_lines - len(wrapped_left)))
     wrapped_right.extend([''] * (max_lines - len(wrapped_right)))
-    
+
     # Combine lines
     result = []
     for left, right in zip(wrapped_left, wrapped_right):
-        result.append(f"{color}{left:<{col_width}} │ {right:<{col_width}}\033[0m")
-    
+        # Account for ANSI color codes in width calculation
+        left_content = re.sub(r'\033\[[0-9;]*m', '', left)
+        right_content = re.sub(r'\033\[[0-9;]*m', '', right)
+        left_padding = ' ' * (col_width - len(left_content))
+        right_padding = ' ' * (col_width - len(right_content))
+        result.append(f"{left}{left_padding} │ {right}{right_padding}")
+
     # Add horizontal separator with same width as content
     separator = f"{color}{'─' * col_width}─┼{'─' * col_width}─\033[0m"
-    
+
     return '\n'.join(result) + '\n' + separator
 
 # Create the CLI app
