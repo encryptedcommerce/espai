@@ -2,39 +2,34 @@
 
 import asyncio
 import signal
+import json
+import shutil
+import textwrap
+from typing import Dict, List, Optional
 from enum import Enum
-from typing import List, Optional
 
 import polars as pl
 import typer
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeElapsedColumn
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 
-from .gemini_client import GeminiClient
-from .models import EntityResult
-from .scraper import Scraper
 from .search_providers import SearchProvider
-from .search_providers.exa import ExaSearchProvider
 from .search_providers.google import GoogleSearchProvider
+from .search_providers.exa import ExaSearchProvider
+from .gemini_client import GeminiClient
+from .scraper import Scraper
+from .models import EntityResult
 
-# Create the CLI app
-app = typer.Typer()
+# Create console for status messages
+status_console = Console(stderr=True)
+console = Console()
 
-# Global state for signal handling
+# Global variables for signal handler
 should_shutdown = False
 _current_results = []
-_current_attributes = []  # Add global for tracking requested attributes
-
-# Console for status messages
-console = Console()
-status_console = Console(stderr=True)
+_current_attributes = []
+_global_output_format = None
+_global_output_file = None
 
 # Output format options
 class OutputFormat(str, Enum):
@@ -166,14 +161,22 @@ async def search(
         "--provider",
         "-p",
         help="Search provider to use"
+    ),
+    scrape: bool = typer.Option(
+        False,
+        "--scrape",
+        "-s",
+        help="Scrape URLs for additional content"
     )
 ):
     """Search and extract structured data from the web."""
-    global _global_output_format, _global_output_file, should_shutdown, _current_results, _current_attributes
     
-    # Set globals for signal handler
+    # Initialize global variables for signal handler
+    global _current_results, _current_attributes, _global_output_format, _global_output_file
+    _current_results = []
+    _current_attributes = []
     _global_output_format = output_format
-    _global_output_file = output_file or f"results.{output_format.value}"
+    _global_output_file = output_file or f"results.{output_format.lower()}"
     
     results = []
     entity_type = None
@@ -184,7 +187,7 @@ async def search(
         gemini = GeminiClient(verbose=verbose, temperature=temperature)
         search = get_search_provider(provider)
         google_search = GoogleSearchProvider()  # For attribute searches
-        scraper = Scraper()
+        scraper = Scraper() if scrape else None
         
         # Parse the query
         if verbose:
@@ -217,7 +220,7 @@ async def search(
             # Add address component columns
             columns.extend(['street_address', 'city', 'state', 'zip'])
         
-        # Create empty DataFrame with specified schema
+        # Initialize empty DataFrame
         results_df = pl.DataFrame(schema={col: pl.Utf8 for col in columns})
         
         # Enumerate search space if needed
@@ -270,19 +273,29 @@ async def search(
                             
                         try:
                             if verbose:
-                                print(f"\033[38;5;33mExtracting from text:\n{result.title}\n{result.snippet}\n{result.url}\033[0m\n")
-                                
+                                left_text = "Found entity in:\n" + \
+                                          f"{result.title}\n" + \
+                                          f"{result.snippet}\n" + \
+                                          f"{result.url}"
+                                  
                             extracted = await gemini.extract_attributes(
                                 f"{result.title}\n{result.snippet}",
                                 result.url,
                                 entity_type,
                                 ["name"]  # Only look for name in first pass
                             )
-                            
+                                
                             if extracted and "name" in extracted:
                                 entity_name = extracted["name"]
                                 if entity_name not in found_entities:
                                     found_entities.add(entity_name)
+                                    
+                                    if verbose:
+                                        right_text = "Gemini Response:\n```json\n" + \
+                                                  json.dumps({"name": entity_name}, indent=2) + \
+                                                  "\n```"
+                                        print(format_two_columns(left_text, right_text))
+                                        print("─" * (shutil.get_terminal_size().columns))
                                     
                                     # Initialize row with name and search space
                                     row_data = {col: None for col in columns}
@@ -292,30 +305,29 @@ async def search(
                                     })
                                     
                                     # Add to DataFrame
-                                    new_row = pl.DataFrame([row_data])
-                                    results_df = pl.concat([results_df, new_row], how="vertical")
+                                    results_df = pl.concat([
+                                        results_df,
+                                        pl.DataFrame([row_data], schema=results_df.schema)
+                                    ], how="vertical")
                                     
-                                    if verbose:
-                                        print(f"\nFound {entity_type}: {entity_name}")
-                                        for attr in attributes:
-                                            if attr == 'address' and row_data.get('address'):
-                                                print(f"  Address: {row_data['address']}")
-                                                # Only show address components that exist
-                                                if row_data.get('street_address'):
-                                                    print(f"    Street: {row_data.get('street_address')}")
-                                                if row_data.get('city'):
-                                                    print(f"    City: {row_data.get('city')}")
-                                                if row_data.get('state'):
-                                                    print(f"    State: {row_data.get('state')}")
-                                                if row_data.get('zip'):
-                                                    print(f"    ZIP: {row_data.get('zip')}")
-                                            elif row_data.get(attr):
-                                                print(f"  {attr.title()}: {row_data.get(attr)}")
+                                    # Update current results for signal handler
+                                    _current_results.append(EntityResult(
+                                        name=row_data['name'],
+                                        search_space=row_data.get('search_space'),
+                                        website=row_data.get('website'),
+                                        phone=row_data.get('phone'),
+                                        email=row_data.get('email'),
+                                        address=row_data.get('address'),
+                                        street_address=row_data.get('street_address'),
+                                        city=row_data.get('city'),
+                                        state=row_data.get('state'),
+                                        zip=row_data.get('zip')
+                                    ))
+                                    
+                                    # Stop if we found all entities
+                                    if len(found_entities) == max_results:
+                                        break
                                         
-                                # Stop if we found all entities
-                                if len(found_entities) == max_results:
-                                    break
-                                    
                         except Exception as e:
                             if verbose:
                                 print(f"\033[38;5;209mError extracting entity: {str(e)}\033[0m\n")
@@ -378,19 +390,40 @@ async def search(
                             
                         try:
                             if verbose:
-                                print(f"\033[38;5;33mExtracting from text:\n{result.title}\n{result.snippet}\n{result.url}\033[0m\n")
-                                
+                                left_text = "Extracting from text:\n" + \
+                                          f"{result.title}\n" + \
+                                          f"{result.snippet}\n" + \
+                                          f"{result.url}"
+                                              
+                            # Only scrape if enabled
+                            content = ""
+                            if scraper:
+                                try:
+                                    content = await scraper.scrape(result.url)
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"\033[38;5;209mError scraping {result.url}: {str(e)}\033[0m\n")
+                                    content = ""
+                            
+                            text = f"{result.title}\n{result.snippet}"
+                            if content:
+                                text += f"\n{content}"
+                                              
                             extracted = await gemini.extract_attributes(
-                                f"{result.title}\n{result.snippet}",
+                                text,
                                 result.url,
                                 entity_type,
                                 [attr for attr in attributes if attr not in found_attributes]
                             )
-                            
+                                
                             if extracted:
                                 if verbose:
-                                    print(f"\033[38;5;33mExtracted attributes: {extracted}\033[0m")
-                                    
+                                    right_text = "Gemini Response:\n```json\n" + \
+                                              json.dumps(extracted, indent=2) + \
+                                              "\n```"
+                                    print(format_two_columns(left_text, right_text))
+                            
+                            if extracted:
                                 # Create new row data starting with existing row
                                 new_row = dict(results_df.row(i, named=True))
                                 
@@ -420,18 +453,29 @@ async def search(
                                     if col in extracted:
                                         new_row[col] = extracted[col]
                                 
-                                # Update DataFrame
-                                results_df = results_df.with_row_count('index').with_columns([
-                                    pl.when(pl.col('index') == i)
-                                    .then(pl.lit(new_row.get(col)))
-                                    .otherwise(pl.col(col))
-                                    .alias(col)
-                                    for col in results_df.columns
-                                ]).drop('index')
+                                # Update the DataFrame with the new row
+                                results_df = pl.concat([
+                                    results_df,
+                                    pl.DataFrame([new_row], schema=results_df.schema)
+                                ], how="vertical")
                                 
-                                if verbose:
-                                    print(f"\033[38;5;33mUpdated row {i}: {new_row}\033[0m")
-                                    
+                                # Update current results for signal handler
+                                _current_results = [
+                                    EntityResult(
+                                        name=row['name'],
+                                        search_space=row.get('search_space'),
+                                        website=row.get('website'),
+                                        phone=row.get('phone'),
+                                        email=row.get('email'),
+                                        address=row.get('address'),
+                                        street_address=row.get('street_address'),
+                                        city=row.get('city'),
+                                        state=row.get('state'),
+                                        zip=row.get('zip')
+                                    )
+                                    for row in results_df.to_dicts()
+                                ]
+                                
                                 # Update found attributes
                                 found_attributes.update(extracted.keys())
                                 found_attributes.update(['street_address', 'city', 'state', 'zip'])
@@ -476,6 +520,42 @@ async def search(
         if isinstance(google_search, GoogleSearchProvider):
             await google_search.close()
 
+def format_two_columns(left_text: str, right_text: str, color: str = "\033[38;5;33m") -> str:
+    """Format text in two columns, each taking 50% of terminal width."""
+    term_width = shutil.get_terminal_size().columns
+    col_width = term_width // 2 - 2  # -2 for padding
+    
+    # Split texts into lines
+    left_lines = left_text.split('\n')
+    right_lines = right_text.split('\n')
+    
+    # Wrap each line to fit column width
+    wrapped_left = []
+    for line in left_lines:
+        wrapped_left.extend(textwrap.wrap(line, width=col_width) or [''])
+        
+    wrapped_right = []
+    for line in right_lines:
+        wrapped_right.extend(textwrap.wrap(line, width=col_width) or [''])
+    
+    # Make both columns same height
+    max_lines = max(len(wrapped_left), len(wrapped_right))
+    wrapped_left.extend([''] * (max_lines - len(wrapped_left)))
+    wrapped_right.extend([''] * (max_lines - len(wrapped_right)))
+    
+    # Combine lines
+    result = []
+    for left, right in zip(wrapped_left, wrapped_right):
+        result.append(f"{color}{left:<{col_width}} │ {right:<{col_width}}\033[0m")
+    
+    # Add horizontal separator with same width as content
+    separator = f"{color}{'─' * col_width}─┼{'─' * col_width}─\033[0m"
+    
+    return '\n'.join(result) + '\n' + separator
+
+# Create the CLI app
+app = typer.Typer()
+
 @app.command()
 def search_wrapper(
     query: str,
@@ -514,6 +594,12 @@ def search_wrapper(
         "--provider",
         "-p",
         help="Search provider to use"
+    ),
+    scrape: bool = typer.Option(
+        False,
+        "--scrape",
+        "-s",
+        help="Scrape URLs for additional content"
     )
 ):
     """Search and extract structured data from the web."""
@@ -524,7 +610,8 @@ def search_wrapper(
         output_file=output_file,
         verbose=verbose,
         temperature=temperature,
-        provider=provider
+        provider=provider,
+        scrape=scrape
     ))
 
 # Expose the Typer app as main for the Poetry script

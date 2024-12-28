@@ -72,10 +72,10 @@ class GeminiClient:
             if hasattr(response, 'parts'):
                 text = '\n'.join(part.text for part in response.parts)
             else:
+                # Handle case where response might already be a dictionary
+                if isinstance(response.text, dict):
+                    return response.text
                 text = response.text
-                
-            if self.verbose:
-                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")  # Medium green color
             
             # Try to find JSON in the response
             try:
@@ -115,8 +115,6 @@ class GeminiClient:
                 if matches:
                     return json.loads(matches[0])
                 
-                if self.verbose:
-                    print(f"\033[38;5;209mNo JSON found in response\033[0m\n")  # Light orange color
                 return None
                     
             except Exception as e:
@@ -320,52 +318,16 @@ Output: {{
     "name": "Freedom Park",
     "street_address": "1515 Golden Gate Parkway",
     "city": "Naples"
-}}
-
-Input text: "Located in Naples, Florida"
-Output: {{
-    "city": "Naples",
-    "state": "FL"
 }}"""
 
         try:
-            response = await self._generate_with_retry(prompt)
-            
-            if hasattr(response, 'parts'):
-                text = '\n'.join(part.text for part in response.parts)
-            else:
-                text = response.text
+            response = await self._generate_and_parse_json(prompt)
+            if response:
+                return response
                 
-            if self.verbose:
-                print(f"\033[38;5;114mGemini Response:\n{text}\033[0m\n")
-                
-            extracted = self._parse_json_response(text)
-            if not extracted:
-                return None
-                
-            # If we have a complete address string, decompose it
-            if 'address' in extracted:
-                address = extracted['address']
-                del extracted['address']
-                
-                # Split address into components
-                parts = address.split(',')
-                if len(parts) >= 1:
-                    extracted['street_address'] = parts[0].strip()
-                if len(parts) >= 2:
-                    city_state = parts[1].strip().split()
-                    if len(city_state) > 0:
-                        extracted['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
-                    if len(city_state) > 1:
-                        extracted['state'] = city_state[-1]
-                if len(parts) >= 3:
-                    extracted['zip'] = parts[2].strip()
-                    
-            return extracted
+            return None
             
         except Exception as e:
-            if self.verbose:
-                print(f"\033[38;5;209mError extracting attributes: {str(e)}\033[0m\n")
             return None
             
     async def parse_search_result(
