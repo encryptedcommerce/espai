@@ -432,68 +432,72 @@ async def search(
                                     print(format_two_columns(left_text, right_text))
 
                             if extracted:
-                                # Create new row data starting with existing row
-                                new_row = dict(results_df.row(i, named=True))
-
-                                # Set the enumerated search space item
-                                if space_item:
-                                    new_row['search_space'] = space_item
-
-                                # First handle address if present
-                                if 'address' in extracted:
-                                    address = extracted['address']
-                                    # Handle case where address is already a dictionary
-                                    if isinstance(address, dict):
-                                        for field in ['street_address', 'city', 'state', 'zip']:
-                                            if field in address:
-                                                new_row[field] = address[field]
+                                # Update existing row with new attributes
+                                for attr, value in extracted.items():
+                                    if attr == 'address':
+                                        address = value
+                                        # Handle case where address is already a dictionary
+                                        if isinstance(address, dict):
+                                            for field in ['street_address', 'city', 'state', 'zip']:
+                                                if field in address:
+                                                    results_df = results_df.with_columns(
+                                                        pl.when(pl.col('name') == entity_name)
+                                                        .then(pl.lit(address[field]))
+                                                        .otherwise(pl.col(field))
+                                                        .alias(field)
+                                                    )
+                                        else:
+                                            # Parse address string
+                                            parts = address.split(',')
+                                            if len(parts) >= 1:
+                                                results_df = results_df.with_columns(
+                                                    pl.when(pl.col('name') == entity_name)
+                                                    .then(pl.lit(parts[0].strip()))
+                                                    .otherwise(pl.col('street_address'))
+                                                    .alias('street_address')
+                                                )
+                                            if len(parts) >= 2:
+                                                city_state = parts[1].strip().split()
+                                                if len(city_state) > 0:
+                                                    city = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
+                                                    results_df = results_df.with_columns(
+                                                        pl.when(pl.col('name') == entity_name)
+                                                        .then(pl.lit(city))
+                                                        .otherwise(pl.col('city'))
+                                                        .alias('city')
+                                                    )
+                                                if len(city_state) > 1:
+                                                    results_df = results_df.with_columns(
+                                                        pl.when(pl.col('name') == entity_name)
+                                                        .then(pl.lit(city_state[-1]))
+                                                        .otherwise(pl.col('state'))
+                                                        .alias('state')
+                                                    )
                                     else:
-                                        # Parse address string
-                                        parts = address.split(',')
-                                        if len(parts) >= 1:
-                                            new_row['street_address'] = parts[0].strip()
-                                        if len(parts) >= 2:
-                                            city_state = parts[1].strip().split()
-                                            if len(city_state) > 0:
-                                                new_row['city'] = ' '.join(city_state[:-1]) if len(city_state) > 1 else city_state[0]
-                                            if len(city_state) > 1:
-                                                new_row['state'] = city_state[-1]
-                                        if len(parts) >= 3:
-                                            new_row['zip'] = parts[2].strip()
-                                    # Remove the full address after decomposing
-                                    extracted.pop('address')
-
-                                # Then update with any other extracted values
-                                for col in results_df.columns:
-                                    if col in extracted:
-                                        new_row[col] = extracted[col]
-
-                                # Update the DataFrame with the new row
-                                results_df = pl.concat([
-                                    results_df,
-                                    pl.DataFrame([new_row], schema=results_df.schema)
-                                ], how="vertical")
+                                        results_df = results_df.with_columns(
+                                            pl.when(pl.col('name') == entity_name)
+                                            .then(pl.lit(value))
+                                            .otherwise(pl.col(attr))
+                                            .alias(attr)
+                                        )
 
                                 # Update current results for signal handler
-                                _current_results = [
-                                    EntityResult(
-                                        name=row['name'],
-                                        search_space=row.get('search_space'),
-                                        website=row.get('website'),
-                                        phone=row.get('phone'),
-                                        email=row.get('email'),
-                                        address=row.get('address'),
-                                        street_address=row.get('street_address'),
-                                        city=row.get('city'),
-                                        state=row.get('state'),
-                                        zip=row.get('zip')
-                                    )
-                                    for row in results_df.to_dicts()
-                                ]
-
-                                # Update found attributes
-                                found_attributes.update(extracted.keys())
-                                found_attributes.update(['street_address', 'city', 'state', 'zip'])
+                                for i, result in enumerate(_current_results):
+                                    if result.name == entity_name:
+                                        row = results_df.filter(pl.col('name') == entity_name).row(0, named=True)
+                                        _current_results[i] = EntityResult(
+                                            name=row['name'],
+                                            search_space=row.get('search_space'),
+                                            website=row.get('website'),
+                                            phone=row.get('phone'),
+                                            email=row.get('email'),
+                                            address=row.get('address'),
+                                            street_address=row.get('street_address'),
+                                            city=row.get('city'),
+                                            state=row.get('state'),
+                                            zip=row.get('zip')
+                                        )
+                                        break
 
                         except Exception as e:
                             if verbose:
